@@ -12,10 +12,10 @@ index 7941def..d7912b1 100644
  bsd/dev/redwood_apple80211.c	standard
 diff --git a/bsd/dev/sweet_wdt.c b/bsd/dev/sweet_wdt.c
 new file mode 100644
-index 0000000..0b198e4
+index 0000000..c3c1ba4
 --- /dev/null
 +++ b/bsd/dev/sweet_wdt.c
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,77 @@
 +/*
 + * lavender: pet the APSS watchdog the shim arms (ADT /sweet-wdt, ~30 s bite).
 + * A hung or panicked kernel stops petting, the watchdog resets the phone and
@@ -53,14 +53,18 @@ index 0000000..0b198e4
 +	if (limit != 0) {
 +		nanoseconds_to_absolutetime((uint64_t)limit * NSEC_PER_SEC, &limit_abs);
 +	}
++	bool petting = true;
++
 +	for (;;) {
 +		uint64_t deadline;
-+		if (limit_abs != 0 && mach_absolute_time() - start >= limit_abs) {
++		if (petting && limit_abs != 0 && mach_absolute_time() - start >= limit_abs) {
 +			printf("SWEET WDT: run limit %u s reached, letting the watchdog bite\n", limit);
 +			sweet_wdt_early_off();
-+			thread_terminate(current_thread());
++			petting = false;
 +		}
-+		sweet_wdt[0x04 / 4] = 1;        /* WDT0_RST */
++		if (petting) {
++			sweet_wdt[0x04 / 4] = 1;        /* WDT0_RST */
++		}
 +		clock_interval_to_deadline(5, NSEC_PER_SEC, &deadline);
 +		(void)assert_wait_deadline(&sweet_wdt_chan, THREAD_UNINT, deadline);
 +		thread_block(THREAD_CONTINUE_NULL);
