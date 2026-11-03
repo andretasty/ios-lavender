@@ -1,21 +1,22 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index c2864ab..7941def 100644
+index c2864ab..d7912b1 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -105,6 +105,7 @@ bsd/dev/random/randomdev.c		standard
+@@ -105,6 +105,8 @@ bsd/dev/random/randomdev.c		standard
  
  bsd/dev/memdev.c			standard
  bsd/dev/sweet_ufs.c			standard
 +bsd/dev/sweet_emmc.c			standard
++bsd/dev/sweet_wdt.c			standard
  bsd/dev/redwood_sta.c		standard
  bsd/dev/redwood_net.c		standard
  bsd/dev/redwood_apple80211.c	standard
 diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
 new file mode 100644
-index 0000000..a9399e5
+index 0000000..a53b023
 --- /dev/null
 +++ b/bsd/dev/sweet_emmc.c
-@@ -0,0 +1,1105 @@
+@@ -0,0 +1,1135 @@
 +/*
 + * sweet_emmc.c - polled SDHCI / eMMC read-only root driver
 + *                Xiaomi Redmi Pad SE (SM6225 "khaje", SDCC1 @ 0x04744000)
@@ -219,16 +220,33 @@ index 0000000..a9399e5
 +	*(volatile uint32_t *)(semmc.base + off) = v;
 +}
 +
++/*
++ * lavender: sub-word stores as 32-bit read-modify-write of the containing
++ * register (sdhci-msm v5). The other bytes of that word are written back as
++ * read, except a SOFTWARE_RESET byte (0x2F), which is written as 0.
++ */
++static inline void
++semmc_wsub(uint32_t off, uint32_t v, uint32_t bytes)
++{
++	uint32_t word = off & ~3u, shift = (off & 3u) * 8u;
++	uint32_t mask = (bytes == 2 ? 0xFFFFu : 0xFFu) << shift;
++	uint32_t cur = *(volatile uint32_t *)(semmc.base + word);
++	if (word == 0x2C && off != 0x2F) {
++		cur &= 0x00FFFFFFu;
++	}
++	*(volatile uint32_t *)(semmc.base + word) = (cur & ~mask) | ((v << shift) & mask);
++}
++
 +static inline void
 +semmc_w16(uint32_t off, uint16_t v)
 +{
-+	*(volatile uint16_t *)(semmc.base + off) = v;
++	semmc_wsub(off, v, 2);
 +}
 +
 +static inline void
 +semmc_w8(uint32_t off, uint8_t v)
 +{
-+	*(volatile uint8_t *)(semmc.base + off) = v;
++	semmc_wsub(off, v, 1);
 +}
 +
 +/* little endian helpers for GPT / EXT_CSD parsing */
@@ -472,13 +490,26 @@ index 0000000..a9399e5
 +		return err;
 +	}
 +
-+	semmc_w16(SDHCI_BLOCK_SIZE, (uint16_t)(0x7000u | SEMMC_SECTOR));
-+	semmc_w16(SDHCI_BLOCK_COUNT, (uint16_t)nblk);
++	static int traced;
++	int trace = traced < 3;
++	if (trace) {
++		traced++;
++		SEMMC_LOG("xfer CMD%u arg=0x%x nblk=%u: block regs", idx, arg, nblk);
++	}
++	semmc_w32(SDHCI_BLOCK_SIZE, ((uint32_t)nblk << 16) | 0x7000u | SEMMC_SECTOR);
 +	semmc_w8(SDHCI_TIMEOUT_CONTROL, 0xE);
++	if (trace) {
++		SEMMC_LOG("xfer: block 0x%08x clk/to 0x%08x, sending command",
++		    semmc_r32(SDHCI_BLOCK_SIZE), semmc_r32(SDHCI_CLOCK_CONTROL));
++	}
 +
 +	err = semmc_cmd(idx, arg,
 +	    SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
 +	    mode, &r1);
++	if (trace) {
++		SEMMC_LOG("xfer: command err=%d r1=0x%08x INT=0x%08x PS=0x%08x", err, r1,
++		    semmc_r32(SDHCI_INT_STATUS), semmc_r32(SDHCI_PRESENT_STATE));
++	}
 +	if (err) {
 +		return err;
 +	}
