@@ -12,10 +12,10 @@ index c2864ab..7941def 100644
  bsd/dev/redwood_apple80211.c	standard
 diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
 new file mode 100644
-index 0000000..d888ea2
+index 0000000..a9399e5
 --- /dev/null
 +++ b/bsd/dev/sweet_emmc.c
-@@ -0,0 +1,1100 @@
+@@ -0,0 +1,1105 @@
 +/*
 + * sweet_emmc.c - polled SDHCI / eMMC read-only root driver
 + *                Xiaomi Redmi Pad SE (SM6225 "khaje", SDCC1 @ 0x04744000)
@@ -812,12 +812,17 @@ index 0000000..d888ea2
 +	semmc.rca = rca & 0xFFFFu;
 +
 +	err = semmc_card_status(&r1);
++	/* lavender: ABL's RCA is not 1; probe the low ones it may have assigned */
++	for (uint32_t probe = 2; err && probe <= 16; probe++) {
++		semmc.rca = probe;
++		err = semmc_card_status(&r1);
++	}
 +	if (err) {
-+		SEMMC_LOG("CMD13 (RCA %u) failed, errno %d - card not addressed "
-+		    "by ABL? try emmcrca=", semmc.rca, err);
++		SEMMC_LOG("CMD13 failed for RCA 1..16, errno %d - card not addressed "
++		    "by ABL? try emmcrca=", err);
 +		return err == ETIMEDOUT ? ENXIO : err;
 +	}
-+	SEMMC_LOG("card R1=0x%08x state=%u", r1, MMC_STATE(r1));
++	SEMMC_LOG("card answers at RCA %u: R1=0x%08x state=%u", semmc.rca, r1, MMC_STATE(r1));
 +
 +	if (MMC_STATE(r1) == MMC_STATE_DATA || MMC_STATE(r1) == MMC_STATE_RCV) {
 +		SEMMC_LOG("card stuck in data state, sending CMD12");
