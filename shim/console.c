@@ -21,6 +21,7 @@ static void ps_putc(char c)
 	volatile uint32_t *h = (volatile uint32_t *)PS_BASE;
 	volatile uint8_t *d = (volatile uint8_t *)(PS_BASE + 12);
 	uint32_t n = h[2];
+	*(volatile uint32_t *)0x17817004UL = 1;	/* pet the APSS watchdog (WDT0_RST) */
 	if (n >= 0x10000)
 		return;
 	d[n] = c;

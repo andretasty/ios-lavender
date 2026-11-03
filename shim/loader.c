@@ -54,8 +54,13 @@ static void copy64(uintptr_t dst, uintptr_t src, uint64_t n)
 {
 	volatile uint64_t *d = (volatile uint64_t *)dst;
 	volatile const uint64_t *s = (volatile const uint64_t *)src;
-	for (uint64_t i = 0; i < (n + 7) / 8; i++)
+	for (uint64_t i = 0; i < (n + 7) / 8; i++) {
+#ifdef LAVENDER
+		if ((i & 0xffff) == 0)
+			*(volatile uint32_t *)0x17817004UL = 1;	/* pet the APSS watchdog */
+#endif
 		d[i] = s[i];
+	}
 }
 
 static void zero64(uintptr_t dst, uint64_t n)

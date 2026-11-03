@@ -343,7 +343,11 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 #else
 		gold_cpufreq_max();
 #endif
+#ifdef LAVENDER
+		uint64_t gt = 0;	/* ~50 s on Gold with the MMU off: longer than the watchdog */
+#else
 		uint64_t gt = speed_ticks();
+#endif
 		con_hex2("SPEED", "silver=", (uint32_t)silver_ticks, "gold=", (uint32_t)gt);
 		delay_ms(1000);
 		con_skip();
@@ -566,8 +570,16 @@ void shim_main(uint64_t dtb)
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 #ifdef LAVENDER
+	/*
+	 * Unattended test loop: arm the APSS watchdog for 30 s (xnu pets it, patch
+	 * 0963) and make any later reset (bite, panic, PSCI) come back in fastboot.
+	 */
+	wr32(IMEM_RESTART_REASON, RESTART_BOOTLOADER);
+	wr32(APSS_WDT + 0x08, 0);	/* WDT0_EN */
+	wr32(APSS_WDT + 0x10, 30 * 32768);	/* WDT0_BARK_TIME: 32 kHz sleep clock */
+	wr32(APSS_WDT + 0x14, 30 * 32768);	/* WDT0_BITE_TIME */
 	wr32(APSS_WDT + 0x04, 1);	/* WDT0_RST */
-	wr32(APSS_WDT + 0x08, 0);	/* WDT0_EN: ABL leaves it armed, it bites in ~11 s */
+	wr32(APSS_WDT + 0x08, 1);
 	ps_init();
 #endif
 	stage = "loader";
