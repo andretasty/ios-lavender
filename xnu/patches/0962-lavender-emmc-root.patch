@@ -1,0 +1,1142 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index c2864ab..7941def 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,7 @@ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/sweet_emmc.c			standard
+ bsd/dev/redwood_sta.c		standard
+ bsd/dev/redwood_net.c		standard
+ bsd/dev/redwood_apple80211.c	standard
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+new file mode 100644
+index 0000000..7e3a8c3
+--- /dev/null
++++ b/bsd/dev/sweet_emmc.c
+@@ -0,0 +1,1099 @@
++/*
++ * sweet_emmc.c - polled SDHCI / eMMC read-only root driver
++ *                Xiaomi Redmi Pad SE (SM6225 "khaje", SDCC1 @ 0x04744000)
++ *
++ * Counterpart of sweet_ufs.c for the eMMC variant of the pad.
++ *
++ *   rd=emmcroot0        select this driver as BSD root (see IOFindBSDRoot hook)
++ *   emmcroot=<name>     GPT partition name to expose as emmcroot0
++ *   emmcrd=<name>       alias of emmcroot= (used only if emmcroot= is absent)
++ *   emmcprobe=1         dump the GPT (read-only) during init
++ *   emmcrca=<n>         card RCA left by ABL (default 1)
++ *
++ * Design rules
++ *   - READ ONLY. There is no write path in this file. Writes get EROFS and
++ *     open(FWRITE) is refused, so nothing can modify userdata or any other
++ *     partition by accident.
++ *   - Deferred access: the controller is NOT reset, re-clocked or re-tuned.
++ *     We rely on ABL having left SDCC1 clocked, the card in transfer state and
++ *     the bus mode (HS200/HS400, DLL) configured. We only reset the CMD and
++ *     DATA lines (never SOFTWARE_RESET_ALL, that would drop the clock setup).
++ *   - Registration with BSD (bdevsw_add) happens only after sweet_emmc_init()
++ *     succeeded.
++ *   - Everything is guarded by ARM64_BOARD_CONFIG_SWEET.
++ *
++ * Bring-up (clock / DLL / regulator / hard reset) is deliberately not done
++ * here yet. When ABL leaves SDCC1 gated, semmc_hw_bringup() is the single
++ * place to port msm_sdhci.c from the u-boot tree (clock rate, CORE_DLL_CONFIG
++ * sequence, CORE_VENDOR_SPEC, vreg/vqmmc, power-on handling).
++ */
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/types.h>
++#include <sys/errno.h>
++#include <sys/conf.h>
++#include <sys/buf.h>
++#include <sys/disk.h>
++#include <sys/proc.h>
++#include <kern/locks.h>
++#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <machine/machine_routines.h>
++
++/* ------------------------------------------------------------------ */
++/* Logging: single choke point so it can be pointed at the Sweet log   */
++/* helper used by sweet_ufs.c without touching the rest of the file.   */
++/* ------------------------------------------------------------------ */
++#define SEMMC_LOG(fmt, ...) printf("SWEET EMMC: " fmt "\n", ##__VA_ARGS__)
++
++extern void delay(int usec);
++#define SEMMC_UDELAY(us) delay(us)
++
++/* ------------------------------------------------------------------ */
++/* Constants                                                           */
++/* ------------------------------------------------------------------ */
++#define SEMMC_DT_PATH           "/sweet-emmc"
++#define SEMMC_DEFAULT_PHYS      0x04744000ULL
++#define SEMMC_DEFAULT_SIZE      0x1000ULL
++#define SEMMC_SECTOR            512u
++#define SEMMC_MAX_XFER_BLKS     128u            /* per CMD18, 64 KiB */
++
++#define SEMMC_CMD_TIMEOUT_US    200000u
++#define SEMMC_BUSY_TIMEOUT_US   2000000u
++#define SEMMC_DATA_TIMEOUT_US   1000000u
++#define SEMMC_INHIBIT_TIMEOUT_US 200000u
++
++/* Standard SDHCI register map */
++#define SDHCI_ARGUMENT          0x08
++#define SDHCI_BLOCK_SIZE        0x04
++#define SDHCI_BLOCK_COUNT       0x06
++#define SDHCI_TRANSFER_MODE     0x0C            /* 16 bit; COMMAND is 0x0E */
++#define SDHCI_COMMAND           0x0E
++#define SDHCI_RESPONSE          0x10
++#define SDHCI_BUFFER            0x20
++#define SDHCI_PRESENT_STATE     0x24
++#define SDHCI_HOST_CONTROL      0x28
++#define SDHCI_POWER_CONTROL     0x29
++#define SDHCI_CLOCK_CONTROL     0x2C
++#define SDHCI_TIMEOUT_CONTROL   0x2E
++#define SDHCI_SOFTWARE_RESET    0x2F
++#define SDHCI_INT_STATUS        0x30
++#define SDHCI_INT_ENABLE        0x34
++#define SDHCI_SIGNAL_ENABLE     0x38
++#define SDHCI_HOST_CONTROL2     0x3E
++#define SDHCI_CAPABILITIES      0x40
++#define SDHCI_CAPABILITIES_1    0x44
++#define SDHCI_HOST_VERSION      0xFE
++
++#define SDHCI_PS_CMD_INHIBIT    0x00000001u
++#define SDHCI_PS_DATA_INHIBIT   0x00000002u
++#define SDHCI_PS_CARD_PRESENT   0x00010000u
++
++#define SDHCI_POWER_ON          0x01u
++
++#define SDHCI_CLK_INT_EN        0x0001u
++#define SDHCI_CLK_INT_STABLE    0x0002u
++#define SDHCI_CLK_CARD_EN       0x0004u
++
++#define SDHCI_RESET_CMD         0x02u
++#define SDHCI_RESET_DATA        0x04u
++
++#define SDHCI_TM_BLKCNT_EN      0x0002u
++#define SDHCI_TM_AUTO_CMD12     0x0004u
++#define SDHCI_TM_READ           0x0010u
++#define SDHCI_TM_MULTI          0x0020u
++
++#define SDHCI_CMD_RESP_NONE     0x00u
++#define SDHCI_CMD_RESP_LONG     0x01u
++#define SDHCI_CMD_RESP_SHORT    0x02u
++#define SDHCI_CMD_RESP_BUSY     0x03u
++#define SDHCI_CMD_CRC           0x08u
++#define SDHCI_CMD_INDEX         0x10u
++#define SDHCI_CMD_DATA          0x20u
++
++#define SDHCI_INT_CMD_COMPLETE  0x00000001u
++#define SDHCI_INT_XFER_COMPLETE 0x00000002u
++#define SDHCI_INT_DATA_AVAIL    0x00000020u
++#define SDHCI_INT_ERROR         0x00008000u
++#define SDHCI_INT_CMD_TIMEOUT   0x00010000u
++#define SDHCI_INT_CMD_CRC       0x00020000u
++#define SDHCI_INT_DATA_TIMEOUT  0x00100000u
++#define SDHCI_INT_DATA_CRC      0x00200000u
++#define SDHCI_INT_ERR_MASK      0x03FF8000u
++#define SDHCI_INT_ALL           0xFFFFFFFFu
++/* status-enable bits we need latched while polling */
++#define SEMMC_INT_ENABLE_MASK   (0x000000FFu | SDHCI_INT_ERR_MASK)
++
++/* MMC commands */
++#define MMC_SEND_EXT_CSD        8u
++#define MMC_STOP_TRANSMISSION   12u
++#define MMC_SEND_STATUS         13u
++#define MMC_SELECT_CARD         7u
++#define MMC_READ_SINGLE_BLOCK   17u
++#define MMC_READ_MULTIPLE_BLOCK 18u
++
++/* R1 card status */
++#define MMC_STATUS_MASK         (~0x0206BF7Fu)  /* same mask as u-boot */
++#define MMC_STATE(r1)           (((r1) >> 9) & 0xFu)
++#define MMC_STATE_STBY          3u
++#define MMC_STATE_TRAN          4u
++#define MMC_STATE_DATA          5u
++#define MMC_STATE_RCV           6u
++
++/* EXT_CSD byte offsets (diagnostics only; we never CMD6) */
++#define EXT_CSD_PART_CONFIG     179
++#define EXT_CSD_BUS_WIDTH       183
++#define EXT_CSD_HS_TIMING       185
++#define EXT_CSD_SEC_COUNT       212
++
++/* ------------------------------------------------------------------ */
++/* Driver state                                                        */
++/* ------------------------------------------------------------------ */
++struct semmc_part {
++	uint64_t first;
++	uint64_t last;
++	char     name[40];
++};
++
++static struct {
++	volatile uint8_t *base;
++	uint64_t          phys;
++	uint32_t          rca;
++	uint64_t          dev_sectors;   /* from EXT_CSD, 0 if unknown */
++	int               attached;      /* controller + card verified */
++	int               ready;         /* partition resolved, I/O allowed */
++	int               major;         /* bdevsw major, -1 if unregistered */
++	struct semmc_part part;
++} semmc = { .major = -1 };
++
++LCK_GRP_DECLARE(semmc_lck_grp, "sweet_emmc");
++LCK_MTX_DECLARE(semmc_lock, &semmc_lck_grp);
++
++/* ------------------------------------------------------------------ */
++/* MMIO accessors (ml_io_map gives device memory: accesses are ordered) */
++/* ------------------------------------------------------------------ */
++static inline uint32_t
++semmc_r32(uint32_t off)
++{
++	return *(volatile uint32_t *)(semmc.base + off);
++}
++
++static inline uint16_t
++semmc_r16(uint32_t off)
++{
++	return *(volatile uint16_t *)(semmc.base + off);
++}
++
++static inline uint8_t
++semmc_r8(uint32_t off)
++{
++	return *(volatile uint8_t *)(semmc.base + off);
++}
++
++static inline void
++semmc_w32(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(semmc.base + off) = v;
++}
++
++static inline void
++semmc_w16(uint32_t off, uint16_t v)
++{
++	*(volatile uint16_t *)(semmc.base + off) = v;
++}
++
++static inline void
++semmc_w8(uint32_t off, uint8_t v)
++{
++	*(volatile uint8_t *)(semmc.base + off) = v;
++}
++
++/* little endian helpers for GPT / EXT_CSD parsing */
++static inline uint32_t
++semmc_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static inline uint64_t
++semmc_le64(const uint8_t *p)
++{
++	return (uint64_t)semmc_le32(p) | ((uint64_t)semmc_le32(p + 4) << 32);
++}
++
++static uint32_t
++semmc_crc32(uint32_t crc, const uint8_t *p, size_t n)
++{
++	crc = ~crc;
++	while (n--) {
++		crc ^= *p++;
++		for (int k = 0; k < 8; k++) {
++			crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
++		}
++	}
++	return ~crc;
++}
++
++/* ------------------------------------------------------------------ */
++/* Low level controller helpers                                        */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Hook for clock / DLL / vreg / reset bring-up ported from
++ * u-boot drivers/mmc/msm_sdhci.c. Intentionally empty: first milestone is
++ * deferred read access on a controller ABL left running.
++ */
++static int
++semmc_hw_bringup(void)
++{
++	volatile uint32_t *power, *status2, *hc_mode;
++	vm_offset_t core;
++	DTEntry entry;
++	const void *prop = NULL;
++	unsigned int plen = 0;
++
++	/* lavender: only with an explicit /sweet-emmc "core-reg" <u64 base> */
++	if (SecureDTLookupEntry(NULL, SEMMC_DT_PATH, &entry) != kSuccess ||
++	    SecureDTGetProperty(entry, "core-reg", &prop, &plen) != kSuccess || plen < 8) {
++		return ENOTSUP;
++	}
++	core = ml_io_map((vm_offset_t)semmc_le64((const uint8_t *)prop), PAGE_SIZE);
++	if (!core) {
++		SEMMC_LOG("bring-up: ml_io_map core failed");
++		return ENOMEM;
++	}
++	power = (volatile uint32_t *)(core + 0x0);
++	status2 = (volatile uint32_t *)(core + 0x6c);
++	hc_mode = (volatile uint32_t *)(core + 0x78);
++
++	SEMMC_LOG("bring-up: power=0x%08x status2=0x%08x hc_mode=0x%08x",
++	    power[0], status2[0], hc_mode[0]);
++
++	/* Trigger self-reset through SW_RST bit (MSM driver). */
++	power[0] = power[0] | 0x00000080u;
++	for (uint32_t t = 0; t < 400000; t++) {
++		if (!(status2[0] & 0x1)) {
++			break;
++		}
++		delay(1);
++	}
++	for (uint32_t t = 0; t < 200000; t++) {
++		if (!(power[0] & 0x00000080u)) {
++			break;
++		}
++		delay(1);
++	}
++	hc_mode[0] = 1;
++	for (uint32_t t = 0; t < 100000; t++) {
++		__asm__ volatile("" ::: "memory");
++	}
++	SEMMC_LOG("bring-up: after reset power=0x%08x status2=0x%08x hc_mode=0x%08x",
++	    power[0], status2[0], hc_mode[0]);
++	return 0;
++}
++
++static int
++semmc_wait_ps_clear(uint32_t mask, uint32_t timeout_us)
++{
++	for (uint32_t t = 0; t < timeout_us; t++) {
++		if ((semmc_r32(SDHCI_PRESENT_STATE) & mask) == 0) {
++			return 0;
++		}
++		SEMMC_UDELAY(1);
++	}
++	return ETIMEDOUT;
++}
++
++static void
++semmc_reset_lines(uint8_t mask)
++{
++	/* CMD/DATA line reset only: SOFTWARE_RESET_ALL would drop ABL's clock. */
++	semmc_w8(SDHCI_SOFTWARE_RESET, mask);
++	for (uint32_t t = 0; t < 100000; t++) {
++		if ((semmc_r8(SDHCI_SOFTWARE_RESET) & mask) == 0) {
++			return;
++		}
++		SEMMC_UDELAY(1);
++	}
++	SEMMC_LOG("line reset 0x%x did not self-clear", mask);
++}
++
++static int
++semmc_err_to_errno(uint32_t st)
++{
++	if (st & (SDHCI_INT_CMD_TIMEOUT | SDHCI_INT_DATA_TIMEOUT)) {
++		return ETIMEDOUT;
++	}
++	if (st & (SDHCI_INT_CMD_CRC | SDHCI_INT_DATA_CRC)) {
++		return EILSEQ;
++	}
++	return EIO;
++}
++
++/*
++ * Issue one command and poll for completion. Does not touch the data
++ * phase; callers with SDHCI_CMD_DATA set must program block size/count
++ * beforehand and drain the buffer afterwards.
++ */
++static int
++semmc_cmd(uint32_t idx, uint32_t arg, uint32_t flags, uint32_t mode,
++    uint32_t *resp)
++{
++	uint32_t inhibit = SDHCI_PS_CMD_INHIBIT;
++	uint32_t st = 0;
++	int err;
++
++	if ((flags & SDHCI_CMD_DATA) ||
++	    ((flags & 3u) == SDHCI_CMD_RESP_BUSY)) {
++		inhibit |= SDHCI_PS_DATA_INHIBIT;
++	}
++	err = semmc_wait_ps_clear(inhibit, SEMMC_INHIBIT_TIMEOUT_US);
++	if (err) {
++		SEMMC_LOG("CMD%u: bus inhibit stuck (PS=0x%08x)", idx,
++		    semmc_r32(SDHCI_PRESENT_STATE));
++		return err;
++	}
++
++	semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_ALL);
++	semmc_w32(SDHCI_ARGUMENT, arg);
++	/* TRANSFER_MODE (low half) + COMMAND (high half) in one write */
++	semmc_w32(SDHCI_TRANSFER_MODE,
++	    (((idx << 8) | flags) << 16) | (mode & 0xFFFFu));
++
++	for (uint32_t t = 0;; t++) {
++		st = semmc_r32(SDHCI_INT_STATUS);
++		if (st & SDHCI_INT_ERR_MASK) {
++			SEMMC_LOG("CMD%u arg=0x%08x failed, INT=0x%08x", idx, arg, st);
++			semmc_reset_lines(SDHCI_RESET_CMD | SDHCI_RESET_DATA);
++			semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_ALL);
++			return semmc_err_to_errno(st);
++		}
++		if (st & SDHCI_INT_CMD_COMPLETE) {
++			break;
++		}
++		if (t >= SEMMC_CMD_TIMEOUT_US) {
++			SEMMC_LOG("CMD%u arg=0x%08x poll timeout", idx, arg);
++			semmc_reset_lines(SDHCI_RESET_CMD | SDHCI_RESET_DATA);
++			return ETIMEDOUT;
++		}
++		SEMMC_UDELAY(1);
++	}
++	semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
++
++	if (resp != NULL && (flags & 3u) != SDHCI_CMD_RESP_NONE) {
++		*resp = semmc_r32(SDHCI_RESPONSE);
++	}
++
++	if ((flags & 3u) == SDHCI_CMD_RESP_BUSY && !(flags & SDHCI_CMD_DATA)) {
++		for (uint32_t t = 0;; t++) {
++			st = semmc_r32(SDHCI_INT_STATUS);
++			if (st & SDHCI_INT_ERR_MASK) {
++				semmc_reset_lines(SDHCI_RESET_CMD | SDHCI_RESET_DATA);
++				semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_ALL);
++				return semmc_err_to_errno(st);
++			}
++			if (st & SDHCI_INT_XFER_COMPLETE) {
++				break;
++			}
++			if (t >= SEMMC_BUSY_TIMEOUT_US) {
++				return ETIMEDOUT;
++			}
++			SEMMC_UDELAY(1);
++		}
++		semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_XFER_COMPLETE);
++	}
++	return 0;
++}
++
++static int
++semmc_card_status(uint32_t *r1)
++{
++	return semmc_cmd(MMC_SEND_STATUS, semmc.rca << 16,
++	    SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, 0, r1);
++}
++
++/* Best effort CMD12 after a failed data transfer. Errors are ignored. */
++static void
++semmc_abort(void)
++{
++	uint32_t r1;
++
++	semmc_reset_lines(SDHCI_RESET_CMD | SDHCI_RESET_DATA);
++	(void)semmc_cmd(MMC_STOP_TRANSMISSION, 0,
++	    SDHCI_CMD_RESP_BUSY | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, 0, &r1);
++}
++
++/*
++ * PIO read of nblk 512-byte blocks using command idx
++ * (8 = EXT_CSD, 17 = single, 18 = multi with auto CMD12).
++ */
++static int
++semmc_xfer_read(uint32_t idx, uint32_t arg, uint32_t nblk, void *dst)
++{
++	uint8_t *out = (uint8_t *)dst;
++	uint32_t mode = SDHCI_TM_BLKCNT_EN | SDHCI_TM_READ;
++	uint32_t r1 = 0, st;
++	int err;
++
++	if (nblk == 0 || nblk > 0xFFFFu) {
++		return EINVAL;
++	}
++	if (idx == MMC_READ_MULTIPLE_BLOCK) {
++		mode |= SDHCI_TM_MULTI | SDHCI_TM_AUTO_CMD12;
++	}
++
++	err = semmc_wait_ps_clear(SDHCI_PS_CMD_INHIBIT | SDHCI_PS_DATA_INHIBIT,
++	    SEMMC_INHIBIT_TIMEOUT_US);
++	if (err) {
++		return err;
++	}
++
++	semmc_w16(SDHCI_BLOCK_SIZE, (uint16_t)(0x7000u | SEMMC_SECTOR));
++	semmc_w16(SDHCI_BLOCK_COUNT, (uint16_t)nblk);
++	semmc_w8(SDHCI_TIMEOUT_CONTROL, 0xE);
++
++	err = semmc_cmd(idx, arg,
++	    SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
++	    mode, &r1);
++	if (err) {
++		return err;
++	}
++	if (r1 & MMC_STATUS_MASK) {
++		SEMMC_LOG("CMD%u R1 error bits 0x%08x", idx, r1 & MMC_STATUS_MASK);
++		semmc_abort();
++		return EIO;
++	}
++
++	for (uint32_t b = 0; b < nblk; b++) {
++		for (uint32_t t = 0;; t++) {
++			st = semmc_r32(SDHCI_INT_STATUS);
++			if (st & SDHCI_INT_ERR_MASK) {
++				SEMMC_LOG("CMD%u data error INT=0x%08x at block %u/%u",
++				    idx, st, b, nblk);
++				semmc_abort();
++				semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_ALL);
++				return semmc_err_to_errno(st);
++			}
++			if (st & SDHCI_INT_DATA_AVAIL) {
++				break;
++			}
++			if (t >= SEMMC_DATA_TIMEOUT_US) {
++				SEMMC_LOG("CMD%u data poll timeout at block %u/%u",
++				    idx, b, nblk);
++				semmc_abort();
++				return ETIMEDOUT;
++			}
++			SEMMC_UDELAY(1);
++		}
++		semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_DATA_AVAIL);
++		for (uint32_t w = 0; w < SEMMC_SECTOR / 4; w++) {
++			uint32_t v = semmc_r32(SDHCI_BUFFER);
++			memcpy(out, &v, sizeof(v));
++			out += sizeof(v);
++		}
++	}
++
++	for (uint32_t t = 0;; t++) {
++		st = semmc_r32(SDHCI_INT_STATUS);
++		if (st & SDHCI_INT_ERR_MASK) {
++			semmc_abort();
++			semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_ALL);
++			return semmc_err_to_errno(st);
++		}
++		if (st & SDHCI_INT_XFER_COMPLETE) {
++			break;
++		}
++		if (t >= SEMMC_BUSY_TIMEOUT_US) {
++			SEMMC_LOG("CMD%u transfer-complete timeout", idx);
++			semmc_abort();
++			return ETIMEDOUT;
++		}
++		SEMMC_UDELAY(1);
++	}
++	semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_XFER_COMPLETE | SDHCI_INT_DATA_AVAIL);
++	return 0;
++}
++
++/* Read absolute device sectors (user data area). Caller holds semmc_lock. */
++static int
++semmc_read_blocks(uint64_t lba, uint32_t nblk, void *dst)
++{
++	uint8_t *out = (uint8_t *)dst;
++	int err;
++
++	if (semmc.base == NULL) {
++		return ENXIO;
++	}
++	if (lba + nblk > 0xFFFFFFFFULL) {
++		return EINVAL;  /* eMMC block addressing is 32 bit */
++	}
++	while (nblk > 0) {
++		uint32_t n = nblk > SEMMC_MAX_XFER_BLKS ? SEMMC_MAX_XFER_BLKS : nblk;
++
++		err = semmc_xfer_read(n > 1 ? MMC_READ_MULTIPLE_BLOCK :
++		    MMC_READ_SINGLE_BLOCK, (uint32_t)lba, n, out);
++		if (err) {
++			SEMMC_LOG("read lba=%llu n=%u failed (errno %d)",
++			    (unsigned long long)lba, n, err);
++			return err;
++		}
++		lba += n;
++		out += (size_t)n * SEMMC_SECTOR;
++		nblk -= n;
++	}
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* GPT                                                                 */
++/* ------------------------------------------------------------------ */
++static int
++semmc_guid_is_zero(const uint8_t *g)
++{
++	for (int i = 0; i < 16; i++) {
++		if (g[i]) {
++			return 0;
++		}
++	}
++	return 1;
++}
++
++/*
++ * Walk the primary GPT (header at LBA 1, 512 byte sectors).
++ *   want  : partition name to locate, or NULL
++ *   dump  : log every populated entry
++ *   out   : filled when want matched
++ * Returns 0 (found, or dump-only pass ok), ENOENT (valid GPT, no match),
++ * EILSEQ (corrupt GPT), or an I/O errno.
++ */
++static int
++semmc_gpt_scan(const char *want, int dump, struct semmc_part *out)
++{
++	uint8_t sec[SEMMC_SECTOR] __attribute__((aligned(8)));
++	struct semmc_part found;
++	uint64_t entries_lba;
++	uint32_t hsz, num, esz, hcrc, acrc, crc = 0;
++	uint64_t total, nsec;
++	int have = 0, err;
++
++	err = semmc_read_blocks(1, 1, sec);
++	if (err) {
++		return err;
++	}
++	if (memcmp(sec, "EFI PART", 8) != 0) {
++		SEMMC_LOG("no GPT signature at LBA 1");
++		return EILSEQ;
++	}
++	hsz = semmc_le32(sec + 12);
++	if (hsz < 92 || hsz > SEMMC_SECTOR) {
++		SEMMC_LOG("bad GPT header size %u", hsz);
++		return EILSEQ;
++	}
++	hcrc = semmc_le32(sec + 16);
++	memset(sec + 16, 0, 4);
++	if (semmc_crc32(0, sec, hsz) != hcrc) {
++		SEMMC_LOG("GPT header CRC mismatch");
++		return EILSEQ;
++	}
++	if (semmc_le64(sec + 24) != 1) {
++		SEMMC_LOG("GPT MyLBA != 1");
++		return EILSEQ;
++	}
++	entries_lba = semmc_le64(sec + 72);
++	num         = semmc_le32(sec + 80);
++	esz         = semmc_le32(sec + 84);
++	acrc        = semmc_le32(sec + 88);
++	if (num == 0 || num > 4096 || esz < 128 || (SEMMC_SECTOR % esz) != 0) {
++		SEMMC_LOG("unsupported GPT geometry: %u entries x %u bytes", num, esz);
++		return EINVAL;
++	}
++	total = (uint64_t)num * esz;
++	nsec = (total + SEMMC_SECTOR - 1) / SEMMC_SECTOR;
++	if (semmc.dev_sectors && entries_lba + nsec > semmc.dev_sectors) {
++		SEMMC_LOG("GPT entry array beyond end of device");
++		return EILSEQ;
++	}
++	SEMMC_LOG("GPT: %u entries x %u bytes at LBA %llu", num, esz,
++	    (unsigned long long)entries_lba);
++
++	memset(&found, 0, sizeof(found));
++	for (uint64_t s = 0; s < nsec; s++) {
++		uint32_t bytes = (uint32_t)((total - s * SEMMC_SECTOR) < SEMMC_SECTOR ?
++		    (total - s * SEMMC_SECTOR) : SEMMC_SECTOR);
++
++		err = semmc_read_blocks(entries_lba + s, 1, sec);
++		if (err) {
++			return err;
++		}
++		crc = semmc_crc32(crc, sec, bytes);
++
++		for (uint32_t off = 0; off + esz <= bytes; off += esz) {
++			const uint8_t *e = sec + off;
++			struct semmc_part p;
++			uint32_t idx = (uint32_t)((s * SEMMC_SECTOR + off) / esz);
++
++			if (semmc_guid_is_zero(e)) {
++				continue;
++			}
++			p.first = semmc_le64(e + 32);
++			p.last  = semmc_le64(e + 40);
++			memset(p.name, 0, sizeof(p.name));
++			for (int i = 0; i < 36 && i < (int)sizeof(p.name) - 1; i++) {
++				uint8_t lo = e[56 + 2 * i], hi = e[57 + 2 * i];
++				if (lo == 0 && hi == 0) {
++					break;
++				}
++				p.name[i] = (hi == 0 && lo >= 0x20 && lo < 0x7F) ? (char)lo : '?';
++			}
++			if (dump) {
++				SEMMC_LOG("GPT #%u %-20s lba %llu..%llu (%llu MiB)", idx + 1,
++				    p.name, (unsigned long long)p.first,
++				    (unsigned long long)p.last,
++				    (unsigned long long)((p.last - p.first + 1) / 2048));
++			}
++			if (want != NULL && !have && strcmp(p.name, want) == 0) {
++				found = p;
++				have = 1;
++			}
++		}
++	}
++
++	if (crc != acrc) {
++		SEMMC_LOG("GPT entry array CRC mismatch (calc 0x%08x, hdr 0x%08x)",
++		    crc, acrc);
++		return EILSEQ;
++	}
++	if (want == NULL) {
++		return 0;
++	}
++	if (!have) {
++		return ENOENT;
++	}
++	if (found.last < found.first ||
++	    (semmc.dev_sectors && found.last >= semmc.dev_sectors)) {
++		SEMMC_LOG("partition '%s' has invalid extent", found.name);
++		return EILSEQ;
++	}
++	*out = found;
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* Controller attach (deferred-read: no reset, no re-clock)            */
++/* ------------------------------------------------------------------ */
++static int
++semmc_dt_lookup(uint64_t *phys, uint64_t *size)
++{
++	DTEntry entry;
++	const void *prop = NULL;
++	unsigned int plen = 0;
++	const uint8_t *p;
++
++	if (SecureDTLookupEntry(NULL, SEMMC_DT_PATH, &entry) != kSuccess) {
++		return ENOENT;
++	}
++	if (SecureDTGetProperty(entry, "reg", &prop, &plen) != kSuccess ||
++	    prop == NULL) {
++		return ENOENT;
++	}
++	p = (const uint8_t *)prop;
++	if (plen >= 16) {                       /* <u64 base, u64 size> */
++		*phys = semmc_le64(p);
++		*size = semmc_le64(p + 8);
++	} else if (plen >= 8) {                 /* <u32 base, u32 size> */
++		*phys = semmc_le32(p);
++		*size = semmc_le32(p + 4);
++	} else {
++		return EINVAL;
++	}
++	if (*phys == 0 || *size == 0) {
++		return EINVAL;
++	}
++	return 0;
++}
++
++static int
++semmc_attach(void)
++{
++	uint64_t phys = SEMMC_DEFAULT_PHYS, size = SEMMC_DEFAULT_SIZE;
++	uint8_t extcsd[SEMMC_SECTOR] __attribute__((aligned(8)));
++	uint32_t caps, ps, r1 = 0, rca = 1;
++	uint16_t clk;
++	int err;
++
++	if (semmc.attached) {
++		return 0;
++	}
++
++	err = semmc_dt_lookup(&phys, &size);
++	if (err) {
++		SEMMC_LOG("no usable %s node (errno %d), using 0x%llx",
++		    SEMMC_DT_PATH, err, (unsigned long long)SEMMC_DEFAULT_PHYS);
++		phys = SEMMC_DEFAULT_PHYS;
++		size = SEMMC_DEFAULT_SIZE;
++	}
++	size = (size + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);
++
++	if (semmc.base == NULL) {
++		semmc.base = (volatile uint8_t *)ml_io_map((vm_offset_t)phys,
++		    (vm_size_t)size);
++		if (semmc.base == NULL) {
++			SEMMC_LOG("ml_io_map(0x%llx) failed", (unsigned long long)phys);
++			return ENOMEM;
++		}
++		semmc.phys = phys;
++	}
++
++	/*
++	 * NOTE: if SDCC1 clocks are gated by ABL the register reads below
++	 * fault instead of returning all-ones; that is the signal that
++	 * semmc_hw_bringup() needs to be implemented from the u-boot code.
++	 */
++	caps = semmc_r32(SDHCI_CAPABILITIES);
++	clk  = semmc_r16(SDHCI_CLOCK_CONTROL);
++	ps   = semmc_r32(SDHCI_PRESENT_STATE);
++	SEMMC_LOG("host @0x%llx ver=0x%04x caps=0x%08x/0x%08x clk=0x%04x ps=0x%08x "
++	    "pwr=0x%02x hc=0x%02x hc2=0x%04x",
++	    (unsigned long long)semmc.phys, semmc_r16(SDHCI_HOST_VERSION), caps,
++	    semmc_r32(SDHCI_CAPABILITIES_1), clk, ps,
++	    semmc_r8(SDHCI_POWER_CONTROL), semmc_r8(SDHCI_HOST_CONTROL),
++	    semmc_r16(SDHCI_HOST_CONTROL2));
++
++	if (caps == 0 || caps == 0xFFFFFFFFu) {
++		SEMMC_LOG("capabilities read 0x%08x: controller not alive", caps);
++		err = semmc_hw_bringup();
++		if (err) {
++			SEMMC_LOG("hw bring-up not implemented (errno %d)", err);
++			return ENXIO;
++		}
++		caps = semmc_r32(SDHCI_CAPABILITIES);
++	}
++	if ((clk & (SDHCI_CLK_INT_EN | SDHCI_CLK_INT_STABLE | SDHCI_CLK_CARD_EN)) !=
++	    (SDHCI_CLK_INT_EN | SDHCI_CLK_INT_STABLE | SDHCI_CLK_CARD_EN) ||
++	    !(semmc_r8(SDHCI_POWER_CONTROL) & SDHCI_POWER_ON)) {
++		SEMMC_LOG("SD clock/power not left running by ABL (clk=0x%04x)", clk);
++		err = semmc_hw_bringup();
++		if (err) {
++			SEMMC_LOG("hw bring-up not implemented (errno %d)", err);
++			return ENXIO;
++		}
++	}
++
++	/* Polled operation: latch the status bits we look at, no IRQs. */
++	semmc_w32(SDHCI_INT_ENABLE, SEMMC_INT_ENABLE_MASK);
++	semmc_w32(SDHCI_SIGNAL_ENABLE, 0);
++	semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_ALL);
++
++	(void)PE_parse_boot_argn("emmcrca", &rca, sizeof(rca));
++	semmc.rca = rca & 0xFFFFu;
++
++	err = semmc_card_status(&r1);
++	if (err) {
++		SEMMC_LOG("CMD13 (RCA %u) failed, errno %d - card not addressed "
++		    "by ABL? try emmcrca=", semmc.rca, err);
++		return err == ETIMEDOUT ? ENXIO : err;
++	}
++	SEMMC_LOG("card R1=0x%08x state=%u", r1, MMC_STATE(r1));
++
++	if (MMC_STATE(r1) == MMC_STATE_DATA || MMC_STATE(r1) == MMC_STATE_RCV) {
++		SEMMC_LOG("card stuck in data state, sending CMD12");
++		semmc_abort();
++		err = semmc_card_status(&r1);
++		if (err) {
++			return err;
++		}
++	}
++	if (MMC_STATE(r1) == MMC_STATE_STBY) {
++		err = semmc_cmd(MMC_SELECT_CARD, semmc.rca << 16,
++		    SDHCI_CMD_RESP_BUSY | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, 0, &r1);
++		if (err) {
++			SEMMC_LOG("CMD7 select failed, errno %d", err);
++			return err;
++		}
++		err = semmc_card_status(&r1);
++		if (err) {
++			return err;
++		}
++	}
++	if (MMC_STATE(r1) != MMC_STATE_TRAN) {
++		SEMMC_LOG("card not in transfer state (state=%u)", MMC_STATE(r1));
++		return ENXIO;
++	}
++
++	/* Diagnostics only: capacity and which hw partition is selected. */
++	err = semmc_xfer_read(MMC_SEND_EXT_CSD, 0, 1, extcsd);
++	if (err == 0) {
++		semmc.dev_sectors = semmc_le32(extcsd + EXT_CSD_SEC_COUNT);
++		SEMMC_LOG("EXT_CSD: sectors=%llu (%llu MiB) part_config=0x%02x "
++		    "bus_width=%u hs_timing=0x%02x",
++		    (unsigned long long)semmc.dev_sectors,
++		    (unsigned long long)(semmc.dev_sectors / 2048),
++		    extcsd[EXT_CSD_PART_CONFIG], extcsd[EXT_CSD_BUS_WIDTH],
++		    extcsd[EXT_CSD_HS_TIMING]);
++		if (extcsd[EXT_CSD_PART_CONFIG] & 0x07) {
++			SEMMC_LOG("warning: boot/RPMB partition selected, GPT view "
++			    "will not be the user area");
++		}
++		if (semmc.dev_sectors == 0) {
++			SEMMC_LOG("byte-addressed (<2GB) cards are not supported");
++			return ENOTSUP;
++		}
++	} else {
++		SEMMC_LOG("EXT_CSD read failed (errno %d), continuing without size",
++		    err);
++		semmc.dev_sectors = 0;
++	}
++
++	semmc.attached = 1;
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* Public entry points                                                 */
++/* ------------------------------------------------------------------ */
++
++/* Read-only GPT dump. Safe to call any time; never registers anything. */
++int
++sweet_emmc_probe(void)
++{
++	int err;
++
++	lck_mtx_lock(&semmc_lock);
++	err = semmc_attach();
++	if (err == 0) {
++		err = semmc_gpt_scan(NULL, 1, NULL);
++	}
++	lck_mtx_unlock(&semmc_lock);
++	SEMMC_LOG("probe %s (errno %d)", err ? "failed" : "ok", err);
++	return err;
++}
++
++/*
++ * Attach controller, validate the card and resolve emmcroot=<name> from
++ * the GPT. 0 on success, errno otherwise. Idempotent.
++ */
++int
++sweet_emmc_init(void)
++{
++	char name[40] = { 0 };
++	uint32_t probe = 0;
++	int err;
++
++	lck_mtx_lock(&semmc_lock);
++	if (semmc.ready) {
++		lck_mtx_unlock(&semmc_lock);
++		return 0;
++	}
++
++	err = semmc_attach();
++	if (err) {
++		goto out;
++	}
++	if (PE_parse_boot_argn("emmcprobe", &probe, sizeof(probe)) && probe) {
++		(void)semmc_gpt_scan(NULL, 1, NULL);
++	}
++
++	if (!PE_parse_boot_argn("emmcroot", name, sizeof(name)) &&
++	    !PE_parse_boot_argn("emmcrd", name, sizeof(name))) {
++		SEMMC_LOG("no emmcroot=<partition> boot-arg");
++		err = EINVAL;
++		goto out;
++	}
++	name[sizeof(name) - 1] = '\0';
++
++	err = semmc_gpt_scan(name, 0, &semmc.part);
++	if (err == ENOENT) {
++		SEMMC_LOG("partition '%s' not found in GPT", name);
++	}
++	if (err) {
++		goto out;
++	}
++
++	SEMMC_LOG("root partition '%s': lba %llu..%llu (%llu MiB), read-only",
++	    semmc.part.name, (unsigned long long)semmc.part.first,
++	    (unsigned long long)semmc.part.last,
++	    (unsigned long long)((semmc.part.last - semmc.part.first + 1) / 2048));
++	semmc.ready = 1;
++out:
++	lck_mtx_unlock(&semmc_lock);
++	if (err) {
++		SEMMC_LOG("init failed (errno %d)", err);
++	}
++	return err;
++}
++
++/* ------------------------------------------------------------------ */
++/* BSD block device                                                    */
++/* ------------------------------------------------------------------ */
++static int
++semmc_bopen(dev_t dev, int flags, int devtype, struct proc *p)
++{
++#pragma unused(devtype, p)
++	if (minor(dev) != 0 || !semmc.ready) {
++		return ENXIO;
++	}
++	if (flags & FWRITE) {
++		return EROFS;
++	}
++	return 0;
++}
++
++static int
++semmc_bclose(dev_t dev, int flags, int devtype, struct proc *p)
++{
++#pragma unused(dev, flags, devtype, p)
++	return 0;
++}
++
++static int
++semmc_bioctl(dev_t dev, u_long cmd, caddr_t data, int flags, struct proc *p)
++{
++#pragma unused(flags, p)
++	if (minor(dev) != 0 || !semmc.ready) {
++		return ENXIO;
++	}
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*(uint32_t *)data = SEMMC_SECTOR;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*(uint64_t *)data = semmc.part.last - semmc.part.first + 1;
++		return 0;
++	case DKIOCISWRITABLE:
++		*(int *)data = 0;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++semmc_bdump(void)
++{
++	return ENXIO;
++}
++
++static int
++semmc_bpsize(dev_t dev)
++{
++	if (minor(dev) != 0 || !semmc.ready) {
++		return -1;
++	}
++	return (int)(semmc.part.last - semmc.part.first + 1);
++}
++
++static void
++semmc_bstrategy(struct buf *bp)
++{
++	caddr_t addr = NULL;
++	uint64_t count, nblk = 0, blkno, parts;
++	int err = 0;
++
++	if (!(buf_flags(bp) & B_READ)) {
++		buf_seterror(bp, EROFS);
++		buf_biodone(bp);
++		return;
++	}
++
++	count = (uint64_t)buf_count(bp);
++	blkno = (uint64_t)buf_blkno(bp);
++	parts = semmc.part.last - semmc.part.first + 1;
++	if (!semmc.ready || (count % SEMMC_SECTOR) != 0) {
++		err = semmc.ready ? EINVAL : ENXIO;
++	} else {
++		nblk = count / SEMMC_SECTOR;
++		if ((int64_t)buf_blkno(bp) < 0 || blkno + nblk > parts) {
++			err = EIO;
++		} else if (nblk != 0) {
++			err = buf_map(bp, &addr);
++			if (err == 0) {
++				lck_mtx_lock(&semmc_lock);
++				err = semmc_read_blocks(semmc.part.first + blkno,
++				    (uint32_t)nblk, addr);
++				lck_mtx_unlock(&semmc_lock);
++				buf_unmap(bp);
++			}
++		}
++	}
++
++	if (err) {
++		buf_setresid(bp, (uint32_t)count);
++		buf_seterror(bp, err);
++	} else {
++		buf_setresid(bp, 0);
++	}
++	buf_biodone(bp);
++}
++
++static struct bdevsw semmc_bdevsw = {
++	.d_open     = semmc_bopen,
++	.d_close    = semmc_bclose,
++	.d_strategy = semmc_bstrategy,
++	.d_ioctl    = semmc_bioctl,
++	.d_dump     = (dump_fcn_t *)semmc_bdump,
++	.d_psize    = semmc_bpsize,
++	.d_type     = D_DISK,
++};
++
++/*
++ * Register emmcroot0 with BSD and return its dev_t. Registration only
++ * happens once sweet_emmc_init() has succeeded.
++ */
++int
++sweet_emmc_register_root(dev_t *out)
++{
++	int err, major;
++
++	err = sweet_emmc_init();
++	if (err) {
++		return err;
++	}
++	lck_mtx_lock(&semmc_lock);
++	if (semmc.major < 0) {
++		major = bdevsw_add(-1, &semmc_bdevsw);
++		if (major < 0) {
++			lck_mtx_unlock(&semmc_lock);
++			SEMMC_LOG("bdevsw_add failed");
++			return ENODEV;
++		}
++		semmc.major = major;
++		SEMMC_LOG("registered emmcroot0 as block major %d", major);
++	}
++	*out = makedev(semmc.major, 0);
++	lck_mtx_unlock(&semmc_lock);
++	return 0;
++}
++
++/*
++ * IOFindBSDRoot hook.
++ *   returns  0  : rd= is not ours, caller continues normally
++ *            1  : handled, *root / rootName are set
++ *           <0  : it was ours but failed, value is -errno
++ */
++int
++sweet_emmc_find_root(const char *rd, char *root_name, size_t name_sz,
++    dev_t *root)
++{
++	int err;
++
++	if (rd == NULL || strcmp(rd, "emmcroot0") != 0) {
++		return 0;
++	}
++	err = sweet_emmc_register_root(root);
++	if (err) {
++		SEMMC_LOG("root emmcroot0 unavailable (errno %d)", err);
++		return -err;
++	}
++	strlcpy(root_name, "emmcroot0", name_sz);
++	SEMMC_LOG("root emmcroot0 -> dev 0x%x", (unsigned)*root);
++	return 1;
++}
++
++#else  /* !ARM64_BOARD_CONFIG_SWEET */
++typedef int sweet_emmc_empty_tu_t;
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index e6c74aa..2c4f9af 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -782,6 +782,20 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 		*oflags = 0;
+ 		goto iofrootx;
+ 	}
++//
++//	lavender: root on a GPT partition of the internal eMMC (bsd/dev/sweet_emmc.c)
++//
++	if (strcmp(rdBootVar, "emmcroot0") == 0) {
++		extern int sweet_emmc_find_root(const char *rd, char *root_name, size_t name_sz, dev_t *root);
++		OSSafeReleaseNULL(matching);
++		int emmc_rc = sweet_emmc_find_root(rdBootVar, rootName, rootNameSize, root);
++		if (emmc_rc != 1) {
++			panic("IOFindBSDRoot: SWEET eMMC root %s unavailable: %d", rdBootVar, -emmc_rc);
++		}
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
+ #endif
+ 
+ //
