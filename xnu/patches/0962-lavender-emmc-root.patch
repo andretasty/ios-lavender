@@ -12,10 +12,10 @@ index c2864ab..7941def 100644
  bsd/dev/redwood_apple80211.c	standard
 diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
 new file mode 100644
-index 0000000..7e3a8c3
+index 0000000..d888ea2
 --- /dev/null
 +++ b/bsd/dev/sweet_emmc.c
-@@ -0,0 +1,1099 @@
+@@ -0,0 +1,1100 @@
 +/*
 + * sweet_emmc.c - polled SDHCI / eMMC read-only root driver
 + *                Xiaomi Redmi Pad SE (SM6225 "khaje", SDCC1 @ 0x04744000)
@@ -69,6 +69,7 @@ index 0000000..7e3a8c3
 +#define SEMMC_LOG(fmt, ...) printf("SWEET EMMC: " fmt "\n", ##__VA_ARGS__)
 +
 +extern void delay(int usec);
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +#define SEMMC_UDELAY(us) delay(us)
 +
 +/* ------------------------------------------------------------------ */
