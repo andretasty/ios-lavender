@@ -12,10 +12,10 @@ index 7941def..d7912b1 100644
  bsd/dev/redwood_apple80211.c	standard
 diff --git a/bsd/dev/sweet_wdt.c b/bsd/dev/sweet_wdt.c
 new file mode 100644
-index 0000000..dd9ab1c
+index 0000000..0b198e4
 --- /dev/null
 +++ b/bsd/dev/sweet_wdt.c
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,73 @@
 +/*
 + * lavender: pet the APSS watchdog the shim arms (ADT /sweet-wdt, ~30 s bite).
 + * A hung or panicked kernel stops petting, the watchdog resets the phone and
@@ -27,6 +27,7 @@ index 0000000..dd9ab1c
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <kern/clock.h>
++#include <mach/mach_time.h>
 +#include <kern/sched_prim.h>
 +#include <kern/startup.h>
 +#include <kern/thread.h>
@@ -39,11 +40,26 @@ index 0000000..dd9ab1c
 +static volatile uint32_t *sweet_wdt;
 +static int sweet_wdt_chan;
 +
++extern void sweet_wdt_early_off(void);  /* pexpert/arm/pe_serial.c */
++
++/* boot-arg sweetwdt=<seconds>: stop petting after that long, so even a live but stuck boot ends in a reset */
 +static void
 +sweet_wdt_thread(__unused void *arg, __unused wait_result_t wr)
 +{
++	uint32_t limit = 0;
++	uint64_t start = mach_absolute_time(), limit_abs = 0;
++
++	(void)PE_parse_boot_argn("sweetwdt", &limit, sizeof(limit));
++	if (limit != 0) {
++		nanoseconds_to_absolutetime((uint64_t)limit * NSEC_PER_SEC, &limit_abs);
++	}
 +	for (;;) {
 +		uint64_t deadline;
++		if (limit_abs != 0 && mach_absolute_time() - start >= limit_abs) {
++			printf("SWEET WDT: run limit %u s reached, letting the watchdog bite\n", limit);
++			sweet_wdt_early_off();
++			thread_terminate(current_thread());
++		}
 +		sweet_wdt[0x04 / 4] = 1;        /* WDT0_RST */
 +		clock_interval_to_deadline(5, NSEC_PER_SEC, &deadline);
 +		(void)assert_wait_deadline(&sweet_wdt_chan, THREAD_UNINT, deadline);
@@ -74,18 +90,25 @@ index 0000000..dd9ab1c
 +}
 +STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, sweet_wdt_init);
 diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
-index 0f5ed99..8756a46 100644
+index 0f5ed99..6b7ff94 100644
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
-@@ -817,6 +817,7 @@ SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) sweet_fbcon_serial_fu
+@@ -817,13 +817,24 @@ SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) sweet_fbcon_serial_fu
   */
  static volatile uint32_t *sweet_ps;
  static uint32_t sweet_ps_cap;
 +static volatile uint32_t *sweet_wdt_early;      /* ADT /sweet-wdt: pet on console output (bsd/dev/sweet_wdt.c) */
  
  void sweet_pstore_append(const char *c, int size);
++void sweet_wdt_early_off(void);
++
++void
++sweet_wdt_early_off(void)
++{
++	sweet_wdt_early = NULL;
++}
  
-@@ -824,6 +825,9 @@ void
+ void
  sweet_pstore_append(const char *c, int size)
  {
  	volatile uint32_t *h = sweet_ps;
@@ -95,7 +118,7 @@ index 0f5ed99..8756a46 100644
  	if (h == NULL) {
  		return;
  	}
-@@ -847,6 +851,10 @@ sweet_pstore_probe(void)
+@@ -847,6 +858,10 @@ sweet_pstore_probe(void)
  	uint64_t const *reg;
  	unsigned int size;
  
