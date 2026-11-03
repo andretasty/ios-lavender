@@ -12,10 +12,10 @@ index 7941def..d7912b1 100644
  bsd/dev/redwood_apple80211.c	standard
 diff --git a/bsd/dev/sweet_wdt.c b/bsd/dev/sweet_wdt.c
 new file mode 100644
-index 0000000..c3c1ba4
+index 0000000..c639895
 --- /dev/null
 +++ b/bsd/dev/sweet_wdt.c
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,108 @@
 +/*
 + * lavender: pet the APSS watchdog the shim arms (ADT /sweet-wdt, ~30 s bite).
 + * A hung or panicked kernel stops petting, the watchdog resets the phone and
@@ -39,6 +39,29 @@ index 0000000..c3c1ba4
 +
 +static volatile uint32_t *sweet_wdt;
 +static int sweet_wdt_chan;
++static volatile uint32_t *sweet_restart_reason;
++
++/*
++ * A watchdog bite boots Android (ABL ignores the IMEM reason then), so every
++ * planned reset goes through here: IMEM restart reason "bootloader", then PSCI
++ * SYSTEM_RESET. Installed as PE_halt_restart, it also runs after a panic when
++ * the debug boot-arg lacks DB_NMI (PE_reboot_on_panic).
++ */
++extern int (*PE_halt_restart)(unsigned int type);
++
++static int
++sweet_reset_to_fastboot(__unused unsigned int type)
++{
++	if (sweet_restart_reason != NULL) {
++		*sweet_restart_reason = 0x77665500;     /* RESTART_BOOTLOADER */
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	register uint64_t x0 __asm__("x0") = 0x84000009;        /* PSCI SYSTEM_RESET */
++	__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8",
++	    "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	for (;;) {
++	}
++}
 +
 +extern void sweet_wdt_early_off(void);  /* pexpert/arm/pe_serial.c */
 +
@@ -58,9 +81,10 @@ index 0000000..c3c1ba4
 +	for (;;) {
 +		uint64_t deadline;
 +		if (petting && limit_abs != 0 && mach_absolute_time() - start >= limit_abs) {
-+			printf("SWEET WDT: run limit %u s reached, letting the watchdog bite\n", limit);
++			printf("SWEET WDT: run limit %u s reached, resetting into fastboot\n", limit);
 +			sweet_wdt_early_off();
 +			petting = false;
++			sweet_reset_to_fastboot(0);
 +		}
 +		if (petting) {
 +			sweet_wdt[0x04 / 4] = 1;        /* WDT0_RST */
@@ -87,6 +111,13 @@ index 0000000..c3c1ba4
 +	if (sweet_wdt == NULL) {
 +		return;
 +	}
++	if (SecureDTGetProperty(entry, "restart-reason", (void const **)&reg, &size) == kSuccess && size >= 8) {
++		vm_offset_t page = ml_io_map(reg[0] & ~0xfffULL, 0x1000);
++		if (page != 0) {
++			sweet_restart_reason = (volatile uint32_t *)(page + (reg[0] & 0xfffULL));
++		}
++	}
++	PE_halt_restart = sweet_reset_to_fastboot;
 +	if (kernel_thread_start(sweet_wdt_thread, NULL, &thread) == KERN_SUCCESS) {
 +		thread_deallocate(thread);
 +	}

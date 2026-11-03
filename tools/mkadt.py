@@ -268,7 +268,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
            # lavender: SDCC1 eMMC host (sdhci@c0c4000 hc_mem) for the read-only root (patch 0962)
            node('sweet-emmc', [ph(), ('compatible', cstr('qcom,sdhci-msm-v5')), ('reg', u64(0x0c0c4000, 0x1000))]),
            # lavender: APSS watchdog the shim arms; xnu pets it (patch 0963)
-           node('sweet-wdt', [ph(), ('reg', u64(0x17817000, 0x1000))])] if LAVENDER else []))
+           node('sweet-wdt', [ph(), ('reg', u64(0x17817000, 0x1000)), ('restart-reason', u64(0x146bf65c))])] if LAVENDER else []))
 
 
 if __name__ == '__main__':
