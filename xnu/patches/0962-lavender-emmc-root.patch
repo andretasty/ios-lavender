@@ -13,10 +13,10 @@ index c2864ab..d7912b1 100644
  bsd/dev/redwood_apple80211.c	standard
 diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
 new file mode 100644
-index 0000000..495694e
+index 0000000..2b45cf3
 --- /dev/null
 +++ b/bsd/dev/sweet_emmc.c
-@@ -0,0 +1,1167 @@
+@@ -0,0 +1,1198 @@
 +/*
 + * sweet_emmc.c - polled SDHCI / eMMC read-only root driver
 + *                Xiaomi Redmi Pad SE (SM6225 "khaje", SDCC1 @ 0x04744000)
@@ -532,7 +532,7 @@ index 0000000..495694e
 +			if (st & SDHCI_INT_DATA_AVAIL) {
 +				break;
 +			}
-+			if (trace && (t == 1000 || t == 100000)) {
++			if (trace && (t == 0 || t == 1000 || t == 100000)) {
 +				SEMMC_LOG("xfer: waiting t=%u INT=0x%08x PS=0x%08x", t, st,
 +				    semmc_r32(SDHCI_PRESENT_STATE));
 +			}
@@ -862,6 +862,37 @@ index 0000000..495694e
 +					cq[0x08 / 4] = cfg & ~1u;       /* CQCFG.CQE_EN off */
 +					SEMMC_LOG("CQHCI disabled: cfg=0x%08x ctl=0x%08x", cq[0x08 / 4], cq[0x0C / 4]);
 +				}
++			}
++		}
++	}
++
++	/*
++	 * lavender: the first PIO read froze the CPU within a millisecond of the
++	 * data arriving. Keep every interrupt source of the host off: mask the
++	 * sdhci-msm v5 power IRQ (CORE_PWRCTL_MASK hc+0x244), disable its GIC SPIs
++	 * (/sweet-emmc "gicd-reg" + "intids"), and select no DMA in HOST_CONTROL.
++	 */
++	{
++		DTEntry entry;
++		const void *gp = NULL, *ip = NULL;
++		unsigned int gl = 0, il = 0;
++		SEMMC_LOG("pwrctl status=0x%08x mask=0x%08x ctl=0x%08x hc=0x%02x",
++		    semmc_r32(0x240), semmc_r32(0x244), semmc_r32(0x24C), semmc_r8(SDHCI_HOST_CONTROL));
++		semmc_w32(0x244, 0);
++		semmc_w32(0x248, 0xFFu);                /* CORE_PWRCTL_CLEAR */
++		semmc_w8(SDHCI_HOST_CONTROL, semmc_r8(SDHCI_HOST_CONTROL) & (uint8_t)~0x18u);
++		if (SecureDTLookupEntry(NULL, SEMMC_DT_PATH, &entry) == kSuccess &&
++		    SecureDTGetProperty(entry, "gicd-reg", &gp, &gl) == kSuccess && gl >= 8 &&
++		    SecureDTGetProperty(entry, "intids", &ip, &il) == kSuccess && il >= 4) {
++			volatile uint32_t *gicd = (volatile uint32_t *)ml_io_map(
++				(vm_offset_t)semmc_le64((const uint8_t *)gp), 0x1000);
++			for (unsigned int i = 0; gicd != NULL && i + 4 <= il; i += 4) {
++				uint32_t id = semmc_le32((const uint8_t *)ip + i);
++				uint32_t bit = 1u << (id % 32), n = id / 32;
++				SEMMC_LOG("GIC intid %u: enabled=%u pending=%u", id,
++				    (gicd[(0x100 / 4) + n] & bit) != 0, (gicd[(0x200 / 4) + n] & bit) != 0);
++				gicd[(0x180 / 4) + n] = bit;    /* GICD_ICENABLER */
++				gicd[(0x280 / 4) + n] = bit;    /* GICD_ICPENDR */
 +			}
 +		}
 +	}
