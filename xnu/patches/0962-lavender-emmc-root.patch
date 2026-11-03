@@ -13,10 +13,10 @@ index c2864ab..d7912b1 100644
  bsd/dev/redwood_apple80211.c	standard
 diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
 new file mode 100644
-index 0000000..a53b023
+index 0000000..495694e
 --- /dev/null
 +++ b/bsd/dev/sweet_emmc.c
-@@ -0,0 +1,1135 @@
+@@ -0,0 +1,1167 @@
 +/*
 + * sweet_emmc.c - polled SDHCI / eMMC read-only root driver
 + *                Xiaomi Redmi Pad SE (SM6225 "khaje", SDCC1 @ 0x04744000)
@@ -532,6 +532,10 @@ index 0000000..a53b023
 +			if (st & SDHCI_INT_DATA_AVAIL) {
 +				break;
 +			}
++			if (trace && (t == 1000 || t == 100000)) {
++				SEMMC_LOG("xfer: waiting t=%u INT=0x%08x PS=0x%08x", t, st,
++				    semmc_r32(SDHCI_PRESENT_STATE));
++			}
 +			if (t >= SEMMC_DATA_TIMEOUT_US) {
 +				SEMMC_LOG("CMD%u data poll timeout at block %u/%u",
 +				    idx, b, nblk);
@@ -831,6 +835,34 @@ index 0000000..a53b023
 +		if (err) {
 +			SEMMC_LOG("hw bring-up not implemented (errno %d)", err);
 +			return ENXIO;
++		}
++	}
++
++	/*
++	 * lavender: ABL may leave the command queue engine (CQHCI, /sweet-emmc
++	 * "cqe-reg") enabled; legacy PIO data transfers then stall. Halt it and
++	 * clear CQCFG.CQE_EN as Linux cqhci_off()/cqhci_deactivate() do.
++	 */
++	{
++		DTEntry entry;
++		const void *prop = NULL;
++		unsigned int plen = 0;
++		if (SecureDTLookupEntry(NULL, SEMMC_DT_PATH, &entry) == kSuccess &&
++		    SecureDTGetProperty(entry, "cqe-reg", &prop, &plen) == kSuccess && plen >= 8) {
++			volatile uint32_t *cq = (volatile uint32_t *)ml_io_map(
++				(vm_offset_t)semmc_le64((const uint8_t *)prop), PAGE_SIZE);
++			if (cq != NULL) {
++				uint32_t cfg = cq[0x08 / 4], ctl = cq[0x0C / 4];
++				SEMMC_LOG("CQHCI ver=0x%08x cfg=0x%08x ctl=0x%08x", cq[0], cfg, ctl);
++				if (cfg & 1u) {
++					cq[0x0C / 4] = ctl | 1u;        /* CQCTL.HALT */
++					for (uint32_t t = 0; t < 100000 && !(cq[0x0C / 4] & 1u); t++) {
++						SEMMC_UDELAY(1);
++					}
++					cq[0x08 / 4] = cfg & ~1u;       /* CQCFG.CQE_EN off */
++					SEMMC_LOG("CQHCI disabled: cfg=0x%08x ctl=0x%08x", cq[0x08 / 4], cq[0x0C / 4]);
++				}
++			}
 +		}
 +	}
 +

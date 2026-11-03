@@ -266,7 +266,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
        # lavender: console mirrored into Linux's ramoops console zone (patch 0960)
        + ([node('sweet-pstore', [ph(), ('reg', u64(0xa0000000, 0x200000))]),
            # lavender: SDCC1 eMMC host (sdhci@c0c4000 hc_mem) for the read-only root (patch 0962)
-           node('sweet-emmc', [ph(), ('compatible', cstr('qcom,sdhci-msm-v5')), ('reg', u64(0x0c0c4000, 0x1000))]),
+           node('sweet-emmc', [ph(), ('compatible', cstr('qcom,sdhci-msm-v5')), ('reg', u64(0x0c0c4000, 0x1000)), ('cqe-reg', u64(0x0c0c5000))]),
            # lavender: APSS watchdog the shim arms; xnu pets it (patch 0963)
            node('sweet-wdt', [ph(), ('reg', u64(0x17817000, 0x1000)), ('restart-reason', u64(0x146bf65c))])] if LAVENDER else []))
 
