@@ -12,6 +12,38 @@
 #define LABEL_COLS	8
 
 volatile uint32_t *con_fb = (volatile uint32_t *)FB_BASE;
+#ifdef LAVENDER
+/* Mirror the console as text into the ramoops console zone (lavender: 0xa0000000,
+   2 MiB), so the next Linux boot shows it in /sys/fs/pstore/console-ramoops-0. */
+#define PS_BASE	0xa0000000UL
+static void ps_putc(char c)
+{
+	volatile uint32_t *h = (volatile uint32_t *)PS_BASE;
+	volatile uint8_t *d = (volatile uint8_t *)(PS_BASE + 12);
+	uint32_t n = h[2];
+	if (n >= 0x10000)
+		return;
+	d[n] = c;
+	h[1] = n + 1;	/* start: next write position */
+	h[2] = n + 1;	/* size: bytes in use */
+}
+static void ps_puts(const char *s)
+{
+	while (*s)
+		ps_putc(*s++);
+}
+void ps_init(void)
+{
+	volatile uint32_t *h = (volatile uint32_t *)PS_BASE;
+	h[1] = 0;
+	h[2] = 0;
+	h[0] = 0x43474244;	/* PERSISTENT_RAM_SIG "DBGC" */
+}
+#else
+#define ps_putc(c) ((void)0)
+#define ps_puts(s) ((void)0)
+void ps_init(void) {}
+#endif
 static uint32_t con_bg;
 static int row;
 
@@ -48,6 +80,8 @@ static void put_char(int col, char ch, uint32_t fg)
 
 static int put_str(int col, const char *s, uint32_t fg)
 {
+	ps_puts(s);
+	ps_putc(32);
 	while (*s)
 		put_char(col++, *s++, fg);
 	return col;
@@ -63,6 +97,7 @@ static void fmt_hex(char *buf, uint64_t v, int digits)
 
 void con_skip(void)
 {
+	ps_putc(10);
 	row++;
 }
 
@@ -70,6 +105,7 @@ void con_str(const char *label, const char *s)
 {
 	put_str(0, label, YELLOW);
 	put_str(LABEL_COLS, s, WHITE);
+	ps_putc(10);
 	row++;
 }
 
@@ -93,5 +129,6 @@ void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint
 		fmt_hex(buf, vb, 8);
 		put_str(col, buf, WHITE);
 	}
+	ps_putc(10);
 	row++;
 }

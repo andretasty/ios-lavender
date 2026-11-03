@@ -12,12 +12,20 @@
 #include "loader.h"
 #include "ufs.h"
 
+#ifdef LAVENDER
+#define IMEM_RESTART_REASON	0x146bf65cUL
+#define PSHOLD			0x010ac000UL
+#define GICD_BASE		0x17a00000UL
+#define GICR_BASE		0x17b00000UL
+#define APSS_WDT		0x17817000UL
+#else
 #define IMEM_RESTART_REASON	0x0c12565cUL	/* qcom,msm-imem@c125000 restart_reason@65c */
-#define RESTART_BOOTLOADER	0x77665500U
 #define PSHOLD			0x0440b000UL
 
 #define GICD_BASE		0x0f200000UL
 #define GICR_BASE		0x0f300000UL
+#endif
+#define RESTART_BOOTLOADER	0x77665500U
 #define GICR_SIZE		0x100000UL
 #define GICR_PE_SIZE		0x20000UL
 #define GICR_TYPER		0x08
@@ -244,7 +252,7 @@ static uint64_t speed_ticks(void)
  * Gold cluster to its top cpufreq-hw level before xnu (which has no cpufreq
  * driver): freq-domain1 0xf523000, LUT +0x110 (32-byte rows), PERF_STATE +0x920.
  */
-static void gold_cpufreq_max(void)
+static void __attribute__((unused)) gold_cpufreq_max(void)
 {
 	uintptr_t b = 0x0f523000;
 	uint32_t best = 0, best_khz = 0, prev = 0;
@@ -283,7 +291,9 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 		 */
 		test_gic();
 		gold_gicr_prepare();
+#ifndef LAVENDER
 		gold_cpufreq_max();
+#endif
 		uint64_t gt = speed_ticks();
 		con_hex2("SPEED", "silver=", (uint32_t)silver_ticks, "gold=", (uint32_t)gt);
 		delay_ms(1000);
@@ -506,6 +516,11 @@ void shim_main(uint64_t dtb)
 	struct mmu_info mi;
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
+#ifdef LAVENDER
+	wr32(APSS_WDT + 0x04, 1);	/* WDT0_RST */
+	wr32(APSS_WDT + 0x08, 0);	/* WDT0_EN: ABL leaves it armed, it bites in ~11 s */
+	ps_init();
+#endif
 	stage = "loader";
 	con_clear(RED);
 	con_str("SHIM", "sweet milestone 4: xnu loader");

@@ -33,6 +33,15 @@ GICR, GICR_SIZE = 0x0f300000, 0x100000
 FB, FB_SIZE = 0x5c000000, 0xf00000
 SWEET_ECID = 0x544f50415a000001  # 'TOPAZ' + 1, synthetic
 FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
+# LAVENDER=1: Redmi Note 7 (SDM660). Same Kryo 260 Silver/Gold layout as topaz; addresses from
+# its live FDT. RAM: the largest System RAM bank 0xa0400000-0x17e4c0000, above ramoops, 32M-aligned.
+LAVENDER = os.environ.get('LAVENDER') == '1'
+if LAVENDER:
+    PHYS_BASE, MEM_SIZE = 0xa2000000, 0xdc000000
+    GICD, GICR = 0x17a00000, 0x17b00000
+    FB, FB_SIZE = 0x9d400000, 0x23ff000
+    FB_H = 2340
+    SWEET_ECID = 0x4c4156454e000001  # 'LAVEN' + 1, synthetic
 # Internal UFS host (ufshc@4804000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x04804000, 0x3000
 TIMEBASE = 19200000
@@ -183,11 +192,12 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         # the kernel's AppleCLCD matches the compatible string.
         # launchd starts wifid only when the device tree has a "wlan" node
         # (com.apple.wifid _LimitLoadToDeviceTree = wlan, marconi-wifi)
+    ] + ([] if LAVENDER else [
         node('wlan', [
             ph(),
             ('device_type', cstr('wlan')),
             ('compatible', cstr('topaz,wcn3988')),
-        ]),
+        ])]) + [
         node('disp0', [
             ph(),
             ('device_type', cstr('display-subsystem')),
@@ -250,7 +260,9 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu or LAVENDER else [ufs])
+       # lavender: console mirrored into Linux's ramoops console zone (patch 0960)
+       + ([node('sweet-pstore', [ph(), ('reg', u64(0xa0000000, 0x200000))])] if LAVENDER else []))
 
 
 if __name__ == '__main__':

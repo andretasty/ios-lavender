@@ -1,0 +1,88 @@
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index d97cba8..24ad967 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -269,6 +269,7 @@ _cnputc(char c, bool poll)
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern void sweet_log_append(const char *c, int size);  /* bsd/dev/sweet_ufs.c */
++extern void sweet_pstore_append(const char *c, int size);  /* pexpert/arm/pe_serial.c */
+ /*
+  * Set by AppleCLCD (boot-arg sweetfb_noconsole=1) once the GUI presents:
+  * console text still goes to the persistent log, but is not drawn over
+@@ -314,6 +315,7 @@ _cnputs(char *c, int size, bool poll)
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	sweet_log_append(c, size);
++	sweet_pstore_append(c, size);
+ 	if (sweet_console_muted && !panic_active()) {
+ 		return;
+ 	}
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 19f27cd..0f5ed99 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -810,9 +810,63 @@ SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) sweet_fbcon_serial_fu
+ 	.device = SERIAL_SWEET_FBCON
+ };
+ 
++/*
++ * lavender: mirror console output into Linux's ramoops console zone (ADT node
++ * "sweet-pstore", reg = PA and size), so the next recovery boot shows it in
++ * /sys/fs/pstore/console-ramoops-0. Ring with the persistent_ram_buffer header.
++ */
++static volatile uint32_t *sweet_ps;
++static uint32_t sweet_ps_cap;
++
++void sweet_pstore_append(const char *c, int size);
++
++void
++sweet_pstore_append(const char *c, int size)
++{
++	volatile uint32_t *h = sweet_ps;
++	if (h == NULL) {
++		return;
++	}
++	volatile uint8_t *d = (volatile uint8_t *)(h + 3);
++	uint32_t pos = h[1], used = h[2];
++	for (int i = 0; i < size; i++) {
++		d[pos] = (uint8_t)c[i];
++		pos = (pos + 1) % sweet_ps_cap;
++		if (used < sweet_ps_cap) {
++			used++;
++		}
++	}
++	h[1] = pos;
++	h[2] = used;
++}
++
++static void
++sweet_pstore_probe(void)
++{
++	DTEntry entry;
++	uint64_t const *reg;
++	unsigned int size;
++
++	if (SecureDTFindEntry("name", "sweet-pstore", &entry) != kSuccess ||
++	    SecureDTGetProperty(entry, "reg", (void const **)&reg, &size) != kSuccess || size < 16) {
++		return;
++	}
++	volatile uint32_t *h = (volatile uint32_t *)ml_io_map(reg[0], reg[1]);
++	if (h == NULL) {
++		return;
++	}
++	h[1] = 0;
++	h[2] = 0;
++	h[0] = 0x43474244;      /* PERSISTENT_RAM_SIG "DBGC" */
++	sweet_ps_cap = (uint32_t)reg[1] - 12;
++	sweet_ps = h;
++}
++
+ static void
+ fbcon_probe(void)
+ {
++	sweet_pstore_probe();
++
+ 	DTEntry entry;
+ 	uint64_t const *reg;
+ 	uint32_t const *val;

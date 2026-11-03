@@ -1,9 +1,14 @@
 #pragma once
 #include <stdint.h>
 
+#ifdef LAVENDER
+#define FB_BASE		0x9d400000UL
+#define FB_H		2340
+#else
 #define FB_BASE		0x5c000000UL	/* reserved-memory cont_splash_region */
-#define FB_W		1080
 #define FB_H		2400
+#endif
+#define FB_W		1080
 #define FB_STRIDE	(FB_W * 4)	/* a8r8g8b8, matches mainline simplefb */
 
 #define RED	0xffff0000U
@@ -14,6 +19,7 @@
 
 extern volatile uint32_t *con_fb;
 
+void ps_init(void);
 void con_clear(uint32_t bg);
 void con_skip(void);
 void con_str(const char *label, const char *s);
