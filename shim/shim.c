@@ -273,6 +273,53 @@ static void __attribute__((unused)) gold_cpufreq_max(void)
 	con_hex2("CPUFREQ", "old=", old, "mhz=", best_khz / 1000);
 }
 
+#ifdef LAVENDER
+/*
+ * lavender: start the Gold (perfcl) PLL at L = 0x20 (614.4 MHz, the lowest OSM
+ * corners) as msm-4.4 clk-cpu-osm-660.c clk_osm_setup_cluster_pll() does and
+ * point the cluster RCG at it (PLL_MAIN_SEL). ABL leaves Gold on GPLL0 (0x401);
+ * xnu boots much further this way. The rail voltage is left as ABL set it.
+ */
+#define PERF_PLL		0x17816000UL
+#define PERF_CMD_RCGR		0x17811050UL
+#define PERF_CFG_RCGR		0x17811054UL
+
+static void perf_rcg(uint32_t cfg)
+{
+	wr32(PERF_CFG_RCGR, cfg);
+	wr32(PERF_CMD_RCGR, rd32(PERF_CMD_RCGR) | 1);
+	for (int i = 0; i < 1000 && (rd32(PERF_CMD_RCGR) & 1); i++)
+		delay_ms(1);
+}
+
+static void gold_clock_up(void)
+{
+	uint32_t cfg0 = rd32(PERF_CFG_RCGR), mode0 = rd32(PERF_PLL);
+
+	perf_rcg(0x0);	/* XO while the PLL is reprogrammed */
+	wr32(PERF_PLL + 0x0, 0x0);
+	wr32(PERF_PLL + 0x4, 0x20);
+	wr32(PERF_PLL + 0xc, 0x01000008);
+	wr32(PERF_PLL + 0x10, 0x20004aa8);
+	wr32(PERF_PLL + 0x0, 0x2);
+	__asm__ volatile("dsb sy" ::: "memory");
+	delay_ms(1);
+	wr32(PERF_PLL + 0x0, 0x6);
+	__asm__ volatile("dsb sy" ::: "memory");
+	delay_ms(1);
+	wr32(PERF_PLL + 0x0, 0x7);
+	__asm__ volatile("dsb sy" ::: "memory");
+	int lock = 0;
+	for (int i = 0; i < 1000 && !lock; i++) {
+		lock = (rd32(PERF_PLL + 0x2c) >> 16) & 1;
+		delay_ms(1);
+	}
+	perf_rcg(lock ? 0x300 : cfg0);
+	con_hex2("GOLDCLK", "cfg0=", cfg0, "mode0=", mode0);
+	con_hex2("GOLDCLK", "lock=", lock, "cfg=", rd32(PERF_CFG_RCGR));
+}
+#endif
+
 static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 {
 	uint64_t mmfr0 = rsr("id_aa64mmfr0_el1");
@@ -291,7 +338,9 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 		 */
 		test_gic();
 		gold_gicr_prepare();
-#ifndef LAVENDER
+#ifdef LAVENDER
+		gold_clock_up();
+#else
 		gold_cpufreq_max();
 #endif
 		uint64_t gt = speed_ticks();
