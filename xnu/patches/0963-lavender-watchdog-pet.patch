@@ -123,11 +123,34 @@ index 0000000..e0eb016
 +	printf("SWEET WDT: petting the APSS watchdog every 5 s\n");
 +}
 +STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, sweet_wdt_init);
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index 24ad967..a1f535f 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -315,7 +315,6 @@ _cnputs(char *c, int size, bool poll)
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	sweet_log_append(c, size);
+-	sweet_pstore_append(c, size);
+ 	if (sweet_console_muted && !panic_active()) {
+ 		return;
+ 	}
 diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
-index 0f5ed99..6b7ff94 100644
+index 0f5ed99..4e54301 100644
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
-@@ -817,13 +817,24 @@ SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) sweet_fbcon_serial_fu
+@@ -761,6 +761,10 @@ fbcon_transmit_ready(void)
+ static void
+ fbcon_transmit_data(uint8_t c)
+ {
++	/* lavender: every byte that reaches the screen, panic output included, also goes to pstore */
++	extern void sweet_pstore_append(const char *, int);
++	char ch = (char)c;
++	sweet_pstore_append(&ch, 1);
+ 	if (c == '\r') {
+ 		fbcon_col = 0;
+ 		return;
+@@ -817,13 +821,24 @@ SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) sweet_fbcon_serial_fu
   */
  static volatile uint32_t *sweet_ps;
  static uint32_t sweet_ps_cap;
@@ -152,7 +175,7 @@ index 0f5ed99..6b7ff94 100644
  	if (h == NULL) {
  		return;
  	}
-@@ -847,6 +858,10 @@ sweet_pstore_probe(void)
+@@ -847,6 +862,10 @@ sweet_pstore_probe(void)
  	uint64_t const *reg;
  	unsigned int size;
  
