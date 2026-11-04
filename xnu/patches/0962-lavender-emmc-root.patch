@@ -13,10 +13,10 @@ index c2864ab..d7912b1 100644
  bsd/dev/redwood_apple80211.c	standard
 diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
 new file mode 100644
-index 0000000..83e2949
+index 0000000..8c2049d
 --- /dev/null
 +++ b/bsd/dev/sweet_emmc.c
-@@ -0,0 +1,1208 @@
+@@ -0,0 +1,1224 @@
 +/*
 + * sweet_emmc.c - polled SDHCI / eMMC read-only root driver
 + *                Xiaomi Redmi Pad SE (SM6225 "khaje", SDCC1 @ 0x04744000)
@@ -71,7 +71,19 @@ index 0000000..83e2949
 +
 +extern void delay(int usec);
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
-+#define SEMMC_UDELAY(us) delay(us)
++/* lavender: plain spin on the timebase, never a scheduler wait, while polling the host */
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++static inline void
++semmc_udelay(uint32_t us)
++{
++	uint64_t span, end;
++	nanoseconds_to_absolutetime((uint64_t)us * 1000u, &span);
++	end = mach_absolute_time() + span;
++	while (mach_absolute_time() < end) {
++	}
++}
++#define SEMMC_UDELAY(us) semmc_udelay(us)
 +
 +/* ------------------------------------------------------------------ */
 +/* Constants                                                           */
@@ -564,6 +576,10 @@ index 0000000..83e2949
 +
 +	for (uint32_t t = 0;; t++) {
 +		st = semmc_r32(SDHCI_INT_STATUS);
++		if (trace && (t == 0 || t == 1000 || t == 100000)) {
++			SEMMC_LOG("xfer: completion wait t=%u INT=0x%08x PS=0x%08x", t, st,
++			    semmc_r32(SDHCI_PRESENT_STATE));
++		}
 +		if (st & SDHCI_INT_ERR_MASK) {
 +			semmc_abort();
 +			semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_ALL);
