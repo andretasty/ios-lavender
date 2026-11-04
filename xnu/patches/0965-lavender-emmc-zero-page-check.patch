@@ -1,0 +1,54 @@
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+index c223f3b..3e1be8e 100644
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -1337,19 +1337,36 @@ semmc_bstrategy(struct buf *bp)
+ 				err = is_read ?
+ 				    semmc_read_blocks(semmc.part.first + blkno, (uint32_t)nblk, addr) :
+ 				    semmc_write_blocks(semmc.part.first + blkno, (uint32_t)nblk, addr);
+-				/* lavender: dyld saw zero Mach-O headers that are not zero on disk; find who returns them */
+-				static int zlogged;
+-				if (is_read && err == 0 && zlogged < 2000) {
+-					const uint64_t *w = (const uint64_t *)addr;
+-					if ((w[0] | w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) == 0) {
+-						uint64_t again[8] = { 0 };
+-						uint8_t one[SEMMC_SECTOR];
+-						int e2 = semmc_read_blocks(semmc.part.first + blkno, 1, one);
+-						memcpy(again, one, sizeof(again));
+-						zlogged++;
+-						printf("Z %llu %llu %x %d %llx\n",
+-						    (unsigned long long)blkno, (unsigned long long)count, buf_flags(bp),
+-						    e2, (unsigned long long)again[0]);
++				/* lavender: dyld sees zero Mach-O headers; re-read every all-zero 4 KiB page alone and log a mismatch */
++				static uint8_t zpage[4096] __attribute__((aligned(64)));
++				static int zlogged, zbad;
++				if (is_read && err == 0) {
++					for (uint64_t o = 0; o + sizeof(zpage) <= count; o += sizeof(zpage)) {
++						const uint64_t *w = (const uint64_t *)(addr + o);
++						uint64_t acc = 0;
++						for (size_t k = 0; k < sizeof(zpage) / 8; k++) {
++							acc |= w[k];
++						}
++						if (acc != 0) {
++							continue;
++						}
++						int e2 = semmc_read_blocks(semmc.part.first + blkno + o / SEMMC_SECTOR,
++						    sizeof(zpage) / SEMMC_SECTOR, zpage);
++						uint64_t acc2 = 0;
++						for (size_t k = 0; k < sizeof(zpage) / 8; k++) {
++							acc2 |= ((const uint64_t *)zpage)[k];
++						}
++						if (acc2 != 0 || e2 != 0) {
++							if (zbad++ < 200) {
++								printf("ZBAD %llu +%llu of %llu e%d %llx\n", (unsigned long long)blkno,
++								    (unsigned long long)o, (unsigned long long)count, e2,
++								    (unsigned long long)((const uint64_t *)zpage)[0]);
++							}
++							memcpy(addr + o, zpage, sizeof(zpage));
++						} else if (zlogged < 300 && o == 0) {
++							zlogged++;
++							printf("Z %llu %llu\n", (unsigned long long)blkno, (unsigned long long)count);
++						}
+ 					}
+ 				}
+ 				lck_mtx_unlock(&semmc_lock);
