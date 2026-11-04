@@ -339,7 +339,9 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 		test_gic();
 		gold_gicr_prepare();
 #ifdef LAVENDER
+#ifdef LAVENDER_PLL	/* slower than ABL's GPLL0 setup in practice (teste15 vs teste16) */
 		gold_clock_up();
+#endif
 #else
 		gold_cpufreq_max();
 #endif
