@@ -1,0 +1,26 @@
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index fde499c..56ece6a 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1895,6 +1895,21 @@ proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
+ 				printf("CRASH %s reason ns %u code 0x%llx: %s\n", p->p_comm,
+ 				    p->p_exit_reason->osr_namespace, p->p_exit_reason->osr_code,
+ 				    desc != NULL ? desc : "(none)");
++				/* lavender: dyld's payload names the file it rejected */
++				const char *kb = p->p_exit_reason->osr_kcd_buf;
++				uint32_t kn = p->p_exit_reason->osr_bufsize;
++				for (uint32_t i = 0; kb != NULL && i + 1 < kn; i++) {
++					if (kb[i] == '/' && (i == 0 || kb[i - 1] == '\0')) {
++						uint32_t j = i;
++						while (j < kn && kb[j] >= 0x20 && kb[j] < 0x7f) {
++							j++;
++						}
++						if (j < kn && kb[j] == '\0' && j - i > 1) {
++							printf("CRASH %s path %s\n", p->p_comm, kb + i);
++						}
++						i = j;
++					}
++				}
+ 			}
+ 		}
+ #endif
