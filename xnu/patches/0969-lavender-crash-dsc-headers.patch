@@ -1,0 +1,39 @@
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 3adfcba..765dd2f 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -886,6 +886,34 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
+ 		printf("%s\n", line);
+ 	}
+ 
++	/* lavender: which shared-cache dylib headers read back as non-Mach-O in this process */
++	if (sig == 6 && slide != 0) {
++		uint64_t base = 0x180000000ULL + slide;
++		uint32_t io[2] = { 0, 0 };
++		uint32_t bad = 0, checked = 0;
++		if (copyin((user_addr_t)(base + 0x1c0), io, sizeof(io)) == 0 && io[1] < 10000) {
++			for (uint32_t i = 0; i < io[1]; i++) {
++				uint64_t ii[4];
++				uint32_t magic = 0;
++				if (copyin((user_addr_t)(base + io[0] + 32ULL * i), ii, sizeof(ii)) != 0) {
++					break;
++				}
++				checked++;
++				int e = copyin((user_addr_t)(ii[0] + slide), &magic, sizeof(magic));
++				if (e == 0 && magic == 0xfeedfacf) {
++					continue;
++				}
++				if (bad++ < 12) {
++					char path[120] = "?";
++					(void)copyinstr((user_addr_t)(base + (uint32_t)ii[3]), path, sizeof(path), NULL);
++					printf("CRASH %s dsc %s @0x%llx e%d magic 0x%x\n", name, path,
++					    (unsigned long long)ii[0], e, magic);
++				}
++			}
++		}
++		printf("CRASH %s dsc checked %u images, %u bad\n", name, checked, bad);
++	}
++
+ 	if (sig == 11 || sig == 10) {
+ 		/* Which mapping the faulting address is in, or which two it falls between. */
+ 		uint64_t far = (uint64_t)saved_state64(ss)->far;
