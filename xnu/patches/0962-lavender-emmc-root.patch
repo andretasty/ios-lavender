@@ -13,10 +13,10 @@ index c2864ab..d7912b1 100644
  bsd/dev/redwood_apple80211.c	standard
 diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
 new file mode 100644
-index 0000000..8c2049d
+index 0000000..8d7d4c9
 --- /dev/null
 +++ b/bsd/dev/sweet_emmc.c
-@@ -0,0 +1,1224 @@
+@@ -0,0 +1,1229 @@
 +/*
 + * sweet_emmc.c - polled SDHCI / eMMC read-only root driver
 + *                Xiaomi Redmi Pad SE (SM6225 "khaje", SDCC1 @ 0x04744000)
@@ -74,10 +74,15 @@ index 0000000..8c2049d
 +/* lavender: plain spin on the timebase, never a scheduler wait, while polling the host */
 +#include <kern/clock.h>
 +#include <mach/mach_time.h>
++extern void sweet_wdt_kick(void);       /* bsd/dev/sweet_wdt.c: long polls must not let the watchdog bite */
 +static inline void
 +semmc_udelay(uint32_t us)
 +{
++	static uint32_t calls;
 +	uint64_t span, end;
++	if ((++calls & 0x3FFu) == 0) {
++		sweet_wdt_kick();
++	}
 +	nanoseconds_to_absolutetime((uint64_t)us * 1000u, &span);
 +	end = mach_absolute_time() + span;
 +	while (mach_absolute_time() < end) {
@@ -563,8 +568,8 @@ index 0000000..8c2049d
 +		}
 +		for (uint32_t w = 0; w < SEMMC_SECTOR / 4; w++) {
 +			uint32_t v = semmc_r32(SDHCI_BUFFER);
-+			if (trace && b == 0 && w == 0) {
-+				SEMMC_LOG("xfer: first word 0x%08x PS=0x%08x", v, semmc_r32(SDHCI_PRESENT_STATE));
++			if (trace && b == 0 && (w == 0 || w == 48 || w == 53 || w == 127 || (w & 31) == 31)) {
++				SEMMC_LOG("xfer: word %u = 0x%08x PS=0x%08x", w, v, semmc_r32(SDHCI_PRESENT_STATE));
 +			}
 +			memcpy(out, &v, sizeof(v));
 +			out += sizeof(v);

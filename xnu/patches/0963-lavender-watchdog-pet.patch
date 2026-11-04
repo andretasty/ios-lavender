@@ -1,9 +1,9 @@
 diff --git a/bsd/dev/sweet_wdt.c b/bsd/dev/sweet_wdt.c
 new file mode 100644
-index 0000000..c639895
+index 0000000..e0eb016
 --- /dev/null
 +++ b/bsd/dev/sweet_wdt.c
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,119 @@
 +/*
 + * lavender: pet the APSS watchdog the shim arms (ADT /sweet-wdt, ~30 s bite).
 + * A hung or panicked kernel stops petting, the watchdog resets the phone and
@@ -52,6 +52,17 @@ index 0000000..c639895
 +}
 +
 +extern void sweet_wdt_early_off(void);  /* pexpert/arm/pe_serial.c */
++
++/* For long polling loops that may run with preemption off (bsd/dev/sweet_emmc.c). */
++void sweet_wdt_kick(void);
++
++void
++sweet_wdt_kick(void)
++{
++	if (sweet_wdt != NULL) {
++		sweet_wdt[0x04 / 4] = 1;        /* WDT0_RST */
++	}
++}
 +
 +/* boot-arg sweetwdt=<seconds>: stop petting after that long, so even a live but stuck boot ends in a reset */
 +static void
