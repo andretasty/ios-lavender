@@ -1,8 +1,17 @@
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
-index 3adfcba..765dd2f 100644
+index 3adfcba..f68688f 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -886,6 +886,34 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
+@@ -823,6 +823,8 @@ exception_triage(
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <vm/vm_shared_region.h>
+ #include <arm/thread.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
+ 
+ /*
+  * SWEET crash report on the console. The phone has no way to get crash
+@@ -886,6 +888,38 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
  		printf("%s\n", line);
  	}
  
@@ -11,8 +20,12 @@ index 3adfcba..765dd2f 100644
 +		uint64_t base = 0x180000000ULL + slide;
 +		uint32_t io[2] = { 0, 0 };
 +		uint32_t bad = 0, checked = 0;
++		uint64_t t0 = mach_absolute_time(), lim;
++		nanoseconds_to_absolutetime(8ULL * NSEC_PER_SEC, &lim);
 +		if (copyin((user_addr_t)(base + 0x1c0), io, sizeof(io)) == 0 && io[1] < 10000) {
-+			for (uint32_t i = 0; i < io[1]; i++) {
++			for (uint32_t i = 0; i < io[1] && mach_absolute_time() - t0 < lim; i++) {
++				extern void sweet_wdt_kick(void);
++				sweet_wdt_kick();
 +				uint64_t ii[4];
 +				uint32_t magic = 0;
 +				if (copyin((user_addr_t)(base + io[0] + 32ULL * i), ii, sizeof(ii)) != 0) {
