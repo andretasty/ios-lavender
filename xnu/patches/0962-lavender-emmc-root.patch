@@ -13,10 +13,10 @@ index c2864ab..d7912b1 100644
  bsd/dev/redwood_apple80211.c	standard
 diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
 new file mode 100644
-index 0000000..e162a72
+index 0000000..be02378
 --- /dev/null
 +++ b/bsd/dev/sweet_emmc.c
-@@ -0,0 +1,1295 @@
+@@ -0,0 +1,1301 @@
 +/*
 + * sweet_emmc.c - polled SDHCI / eMMC read-only root driver
 + *                Xiaomi Redmi Pad SE (SM6225 "khaje", SDCC1 @ 0x04744000)
@@ -1144,6 +1144,7 @@ index 0000000..e162a72
 +semmc_bopen(dev_t dev, int flags, int devtype, struct proc *p)
 +{
 +#pragma unused(devtype, p)
++	SEMMC_LOG("open dev 0x%x flags 0x%x", (unsigned)dev, flags);
 +	if (minor(dev) != 0 || !semmc.ready) {
 +		return ENXIO;
 +	}
@@ -1164,6 +1165,11 @@ index 0000000..e162a72
 +semmc_bioctl(dev_t dev, u_long cmd, caddr_t data, int flags, struct proc *p)
 +{
 +#pragma unused(flags, p)
++	static int logged;
++	if (logged < 12) {
++		logged++;
++		SEMMC_LOG("ioctl 0x%lx", (unsigned long)cmd);
++	}
 +	if (minor(dev) != 0 || !semmc.ready) {
 +		return ENXIO;
 +	}

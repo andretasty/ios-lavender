@@ -1,9 +1,9 @@
 diff --git a/bsd/dev/sweet_wdt.c b/bsd/dev/sweet_wdt.c
 new file mode 100644
-index 0000000..e0eb016
+index 0000000..e58722a
 --- /dev/null
 +++ b/bsd/dev/sweet_wdt.c
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,125 @@
 +/*
 + * lavender: pet the APSS watchdog the shim arms (ADT /sweet-wdt, ~30 s bite).
 + * A hung or panicked kernel stops petting, the watchdog resets the phone and
@@ -87,6 +87,12 @@ index 0000000..e0eb016
 +		}
 +		if (petting) {
 +			sweet_wdt[0x04 / 4] = 1;        /* WDT0_RST */
++		}
++		static uint32_t beats;
++		if ((++beats % 3) == 0) {
++			uint64_t ns;
++			absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
++			printf("SWEET WDT: alive %llu s\n", ns / NSEC_PER_SEC);
 +		}
 +		clock_interval_to_deadline(5, NSEC_PER_SEC, &deadline);
 +		(void)assert_wait_deadline(&sweet_wdt_chan, THREAD_UNINT, deadline);
