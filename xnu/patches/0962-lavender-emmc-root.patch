@@ -13,10 +13,10 @@ index c2864ab..d7912b1 100644
  bsd/dev/redwood_apple80211.c	standard
 diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
 new file mode 100644
-index 0000000..cf06dec
+index 0000000..a3a3078
 --- /dev/null
 +++ b/bsd/dev/sweet_emmc.c
-@@ -0,0 +1,1305 @@
+@@ -0,0 +1,1421 @@
 +/*
 + * sweet_emmc.c - polled SDHCI / eMMC read-only root driver
 + *                Xiaomi Redmi Pad SE (SM6225 "khaje", SDCC1 @ 0x04744000)
@@ -30,9 +30,9 @@ index 0000000..cf06dec
 + *   emmcrca=<n>         card RCA left by ABL (default 1)
 + *
 + * Design rules
-+ *   - READ ONLY. There is no write path in this file. Writes get EROFS and
-+ *     open(FWRITE) is refused, so nothing can modify userdata or any other
-+ *     partition by accident.
++ *   - Read-only unless boot-arg emmcrw=1 (lavender): then writes go to the
++ *     root partition only, within its bounds; without it writes get EROFS and
++ *     open(FWRITE) is refused.
 + *   - Deferred access: the controller is NOT reset, re-clocked or re-tuned.
 + *     We rely on ABL having left SDCC1 clocked, the card in transfer state and
 + *     the bus mode (HS200/HS400, DLL) configured. We only reset the CMD and
@@ -504,7 +504,27 @@ index 0000000..cf06dec
 +}
 +
 +/*
-+ * PIO read of nblk 512-byte blocks using command idx
++ * One 64-bit ADMA2 descriptor right behind the bounce buffer: attr
++ * valid|end|tran, length (nblk * 512, < 64 KiB), address. Points the host at it.
++ */
++static void
++semmc_adma_arm(uint32_t nblk)
++{
++	volatile uint32_t *desc = (volatile uint32_t *)(semmc_dma + SEMMC_DMA_SIZE);
++	uint64_t desc_pa = semmc_dma_pa + SEMMC_DMA_SIZE;
++
++	desc[0] = 0x0023u | (((nblk * SEMMC_SECTOR) & 0xFFFFu) << 16);
++	desc[1] = (uint32_t)semmc_dma_pa;
++	desc[2] = (uint32_t)(semmc_dma_pa >> 32);
++	desc[3] = 0;
++	flush_dcache64((addr64_t)semmc_dma_pa, SEMMC_DMA_ALLOC, TRUE);
++	semmc_w32(SDHCI_ADMA_ADDRESS, (uint32_t)desc_pa);
++	semmc_w32(SDHCI_ADMA_ADDRESS_HI, (uint32_t)(desc_pa >> 32));
++	semmc_w8(SDHCI_HOST_CONTROL, semmc_r8(SDHCI_HOST_CONTROL) | 0x18u);    /* ADMA2 64-bit */
++}
++
++/*
++ * Read nblk 512-byte blocks using command idx
 + * (8 = EXT_CSD, 17 = single, 18 = multi with auto CMD12).
 + */
 +static int
@@ -539,17 +559,7 @@ index 0000000..cf06dec
 +	}
 +	int dma = semmc_dma_pa != 0 && nblk * SEMMC_SECTOR <= SEMMC_DMA_SIZE;
 +	if (dma) {
-+		/* one 64-bit ADMA2 descriptor: attr valid|end|tran, length (0 = 64 KiB), address */
-+		volatile uint32_t *desc = (volatile uint32_t *)(semmc_dma + SEMMC_DMA_SIZE);
-+		uint64_t desc_pa = semmc_dma_pa + SEMMC_DMA_SIZE;
-+		desc[0] = 0x0023u | (((nblk * SEMMC_SECTOR) & 0xFFFFu) << 16);
-+		desc[1] = (uint32_t)semmc_dma_pa;
-+		desc[2] = (uint32_t)(semmc_dma_pa >> 32);
-+		desc[3] = 0;
-+		flush_dcache64((addr64_t)semmc_dma_pa, SEMMC_DMA_ALLOC, TRUE);
-+		semmc_w32(SDHCI_ADMA_ADDRESS, (uint32_t)desc_pa);
-+		semmc_w32(SDHCI_ADMA_ADDRESS_HI, (uint32_t)(desc_pa >> 32));
-+		semmc_w8(SDHCI_HOST_CONTROL, semmc_r8(SDHCI_HOST_CONTROL) | 0x18u);    /* ADMA2 64-bit */
++		semmc_adma_arm(nblk);
 +		mode |= SDHCI_TM_DMA;
 +	}
 +	semmc_w32(SDHCI_BLOCK_SIZE, ((uint32_t)nblk << 16) | 0x7000u | SEMMC_SECTOR);
@@ -677,6 +687,105 @@ index 0000000..cf06dec
 +		}
 +		lba += n;
 +		out += (size_t)n * SEMMC_SECTOR;
++		nblk -= n;
++	}
++	return 0;
++}
++
++/*
++ * lavender: writes (boot-arg emmcrw=1, userdata only: bstrategy checks the
++ * partition bounds). CMD24/CMD25 + auto CMD12 over the same ADMA2 bounce
++ * buffer, then CMD13 until the card is back in TRAN with READY_FOR_DATA.
++ */
++#define MMC_WRITE_BLOCK                 24u
++#define MMC_WRITE_MULTIPLE_BLOCK        25u
++#define MMC_READY_FOR_DATA              (1u << 8)
++static int semmc_rw;
++
++static int
++semmc_xfer_write(uint32_t lba, uint32_t nblk, const void *src)
++{
++	uint32_t idx = nblk > 1 ? MMC_WRITE_MULTIPLE_BLOCK : MMC_WRITE_BLOCK;
++	uint32_t mode = SDHCI_TM_BLKCNT_EN | SDHCI_TM_DMA, r1 = 0, st;
++	int err;
++
++	if (semmc_dma_pa == 0 || nblk == 0 || nblk * SEMMC_SECTOR > SEMMC_DMA_SIZE) {
++		return EINVAL;
++	}
++	if (nblk > 1) {
++		mode |= SDHCI_TM_MULTI | SDHCI_TM_AUTO_CMD12;
++	}
++	err = semmc_wait_ps_clear(SDHCI_PS_CMD_INHIBIT | SDHCI_PS_DATA_INHIBIT,
++	    SEMMC_INHIBIT_TIMEOUT_US);
++	if (err) {
++		return err;
++	}
++	memcpy((void *)semmc_dma, src, (size_t)nblk * SEMMC_SECTOR);
++	semmc_adma_arm(nblk);
++	semmc_w32(SDHCI_BLOCK_SIZE, (nblk << 16) | 0x7000u | SEMMC_SECTOR);
++	semmc_w8(SDHCI_TIMEOUT_CONTROL, 0xE);
++	err = semmc_cmd(idx, lba,
++	    SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
++	    mode, &r1);
++	if (err) {
++		return err;
++	}
++	if (r1 & MMC_STATUS_MASK) {
++		SEMMC_LOG("CMD%u R1 error bits 0x%08x", idx, r1 & MMC_STATUS_MASK);
++		semmc_abort();
++		return EIO;
++	}
++	for (uint32_t t = 0;; t++) {
++		st = semmc_r32(SDHCI_INT_STATUS);
++		if (st & SDHCI_INT_ERR_MASK) {
++			SEMMC_LOG("CMD%u write error INT=0x%08x", idx, st);
++			semmc_abort();
++			semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_ALL);
++			return semmc_err_to_errno(st);
++		}
++		if (st & SDHCI_INT_XFER_COMPLETE) {
++			break;
++		}
++		if (t >= SEMMC_BUSY_TIMEOUT_US) {
++			SEMMC_LOG("CMD%u write transfer-complete timeout", idx);
++			semmc_abort();
++			return ETIMEDOUT;
++		}
++		SEMMC_UDELAY(1);
++	}
++	semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_XFER_COMPLETE | SDHCI_INT_DMA);
++	for (uint32_t t = 0;; t++) {
++		err = semmc_card_status(&r1);
++		if (err == 0 && MMC_STATE(r1) == MMC_STATE_TRAN && (r1 & MMC_READY_FOR_DATA)) {
++			return 0;
++		}
++		if (t >= 20000) {
++			SEMMC_LOG("CMD%u: card busy after write (R1=0x%08x err %d)", idx, r1, err);
++			return ETIMEDOUT;
++		}
++		SEMMC_UDELAY(100);
++	}
++}
++
++/* Write absolute device sectors (user data area). Caller holds semmc_lock. */
++static int
++semmc_write_blocks(uint64_t lba, uint32_t nblk, const void *src)
++{
++	const uint8_t *in = (const uint8_t *)src;
++	int err;
++
++	if (lba + nblk > 0xFFFFFFFFULL) {
++		return EINVAL;
++	}
++	while (nblk) {
++		uint32_t n = nblk > SEMMC_MAX_XFER_BLKS ? SEMMC_MAX_XFER_BLKS : nblk;
++		err = semmc_xfer_write((uint32_t)lba, n, in);
++		if (err) {
++			SEMMC_LOG("write lba=%llu n=%u failed (errno %d)", (unsigned long long)lba, n, err);
++			return err;
++		}
++		lba += n;
++		in += (size_t)n * SEMMC_SECTOR;
 +		nblk -= n;
 +	}
 +	return 0;
@@ -1091,9 +1200,13 @@ index 0000000..cf06dec
 +sweet_emmc_init(void)
 +{
 +	char name[40] = { 0 };
-+	uint32_t probe = 0;
++	uint32_t probe = 0, rw = 0;
 +	int err;
 +
++	if (PE_parse_boot_argn("emmcrw", &rw, sizeof(rw)) && rw == 1) {
++		semmc_rw = 1;
++		SEMMC_LOG("writes enabled (emmcrw=1), userdata only");
++	}
 +	lck_mtx_lock(&semmc_lock);
 +	if (semmc.ready) {
 +		lck_mtx_unlock(&semmc_lock);
@@ -1124,7 +1237,8 @@ index 0000000..cf06dec
 +		goto out;
 +	}
 +
-+	SEMMC_LOG("root partition '%s': lba %llu..%llu (%llu MiB), read-only",
++	SEMMC_LOG(semmc_rw ? "root partition '%s': lba %llu..%llu (%llu MiB), read-write" :
++	    "root partition '%s': lba %llu..%llu (%llu MiB), read-only",
 +	    semmc.part.name, (unsigned long long)semmc.part.first,
 +	    (unsigned long long)semmc.part.last,
 +	    (unsigned long long)((semmc.part.last - semmc.part.first + 1) / 2048));
@@ -1148,7 +1262,7 @@ index 0000000..cf06dec
 +	if (minor(dev) != 0 || !semmc.ready) {
 +		return ENXIO;
 +	}
-+	if (flags & FWRITE) {
++	if ((flags & FWRITE) && !semmc_rw) {
 +		return EROFS;
 +	}
 +	return 0;
@@ -1184,7 +1298,7 @@ index 0000000..cf06dec
 +		*(uint64_t *)data = semmc.part.last - semmc.part.first + 1;
 +		return 0;
 +	case DKIOCISWRITABLE:
-+		*(int *)data = 0;
++		*(int *)data = semmc_rw;
 +		return 0;
 +	default:
 +		return ENOTTY;
@@ -1214,7 +1328,8 @@ index 0000000..cf06dec
 +	uint64_t count, nblk = 0, blkno, parts;
 +	int err = 0;
 +
-+	if (!(buf_flags(bp) & B_READ)) {
++	int is_read = (buf_flags(bp) & B_READ) != 0;
++	if (!is_read && !semmc_rw) {
 +		buf_seterror(bp, EROFS);
 +		buf_biodone(bp);
 +		return;
@@ -1238,8 +1353,9 @@ index 0000000..cf06dec
 +			err = buf_map(bp, &addr);
 +			if (err == 0) {
 +				lck_mtx_lock(&semmc_lock);
-+				err = semmc_read_blocks(semmc.part.first + blkno,
-+				    (uint32_t)nblk, addr);
++				err = is_read ?
++				    semmc_read_blocks(semmc.part.first + blkno, (uint32_t)nblk, addr) :
++				    semmc_write_blocks(semmc.part.first + blkno, (uint32_t)nblk, addr);
 +				lck_mtx_unlock(&semmc_lock);
 +				buf_unmap(bp);
 +			}
