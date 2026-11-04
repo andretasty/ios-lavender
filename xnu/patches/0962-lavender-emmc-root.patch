@@ -13,7 +13,7 @@ index c2864ab..d7912b1 100644
  bsd/dev/redwood_apple80211.c	standard
 diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
 new file mode 100644
-index 0000000..a3a3078
+index 0000000..11d7713
 --- /dev/null
 +++ b/bsd/dev/sweet_emmc.c
 @@ -0,0 +1,1421 @@
@@ -1237,11 +1237,11 @@ index 0000000..a3a3078
 +		goto out;
 +	}
 +
-+	SEMMC_LOG(semmc_rw ? "root partition '%s': lba %llu..%llu (%llu MiB), read-write" :
-+	    "root partition '%s': lba %llu..%llu (%llu MiB), read-only",
++	SEMMC_LOG("root partition '%s': lba %llu..%llu (%llu MiB), %s",
 +	    semmc.part.name, (unsigned long long)semmc.part.first,
 +	    (unsigned long long)semmc.part.last,
-+	    (unsigned long long)((semmc.part.last - semmc.part.first + 1) / 2048));
++	    (unsigned long long)((semmc.part.last - semmc.part.first + 1) / 2048),
++	    semmc_rw ? "read-write" : "read-only");
 +	semmc.ready = 1;
 +out:
 +	lck_mtx_unlock(&semmc_lock);
