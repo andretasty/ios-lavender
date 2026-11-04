@@ -1,0 +1,24 @@
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index a20a764..3adfcba 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -873,6 +873,19 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
+ 	}
+ 	printf("%s\n", line);
+ 
++	/* lavender: dyld finds a zero Mach-O header; is the mapped header page zero? */
++	if (mh != 0) {
++		static const uint32_t offs[] = { 0, 0x20, 0x1000, 0x3ff0, 0x4000 };
++		n = snprintf(line, sizeof(line), "CRASH %s mhmem", name);
++		for (size_t i = 0; i < sizeof(offs) / sizeof(offs[0]); i++) {
++			uint64_t w[2] = { 0, 0 };
++			int e = copyin((user_addr_t)(mh + offs[i]), w, sizeof(w));
++			n += snprintf(line + n, sizeof(line) - n, " +%x:%s%llx", offs[i], e ? "E" : "",
++			    (unsigned long long)w[0]);
++		}
++		printf("%s\n", line);
++	}
++
+ 	if (sig == 11 || sig == 10) {
+ 		/* Which mapping the faulting address is in, or which two it falls between. */
+ 		uint64_t far = (uint64_t)saved_state64(ss)->far;
