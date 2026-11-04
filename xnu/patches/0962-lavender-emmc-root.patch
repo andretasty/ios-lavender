@@ -13,10 +13,10 @@ index c2864ab..d7912b1 100644
  bsd/dev/redwood_apple80211.c	standard
 diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
 new file mode 100644
-index 0000000..c87e5b5
+index 0000000..e162a72
 --- /dev/null
 +++ b/bsd/dev/sweet_emmc.c
-@@ -0,0 +1,1287 @@
+@@ -0,0 +1,1295 @@
 +/*
 + * sweet_emmc.c - polled SDHCI / eMMC read-only root driver
 + *                Xiaomi Redmi Pad SE (SM6225 "khaje", SDCC1 @ 0x04744000)
@@ -118,7 +118,7 @@ index 0000000..c87e5b5
 +#define SEMMC_DEFAULT_PHYS      0x04744000ULL
 +#define SEMMC_DEFAULT_SIZE      0x1000ULL
 +#define SEMMC_SECTOR            512u
-+#define SEMMC_MAX_XFER_BLKS     128u            /* per CMD18, 64 KiB */
++#define SEMMC_MAX_XFER_BLKS     64u             /* per CMD18, 32 KiB: the ADMA2 length field never wraps to 0 */
 +
 +#define SEMMC_CMD_TIMEOUT_US    200000u
 +#define SEMMC_BUSY_TIMEOUT_US   2000000u
@@ -528,8 +528,11 @@ index 0000000..c87e5b5
 +		return err;
 +	}
 +
-+	static int traced;
-+	int trace = traced < 3;
++	static int traced, traced18;
++	int trace = traced < 3 || (idx == MMC_READ_MULTIPLE_BLOCK && traced18 < 2);
++	if (idx == MMC_READ_MULTIPLE_BLOCK && trace) {
++		traced18++;
++	}
 +	if (trace) {
 +		traced++;
 +		SEMMC_LOG("xfer CMD%u arg=0x%x nblk=%u: block regs", idx, arg, nblk);
@@ -1210,6 +1213,11 @@ index 0000000..c87e5b5
 +	count = (uint64_t)buf_count(bp);
 +	blkno = (uint64_t)buf_blkno(bp);
 +	parts = semmc.part.last - semmc.part.first + 1;
++	static int logged;
++	if (logged < 6) {
++		logged++;
++		SEMMC_LOG("strategy: blkno=%llu count=%llu", (unsigned long long)blkno, (unsigned long long)count);
++	}
 +	if (!semmc.ready || (count % SEMMC_SECTOR) != 0) {
 +		err = semmc.ready ? EINVAL : ENXIO;
 +	} else {
