@@ -1,0 +1,31 @@
+diff --git a/bsd/kern/kern_mman.c b/bsd/kern/kern_mman.c
+index 56f3d58..c2bf54a 100644
+--- a/bsd/kern/kern_mman.c
++++ b/bsd/kern/kern_mman.c
+@@ -896,6 +896,26 @@ map_file_retry:
+ 		}
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* lavender: dyld rejects some file of SpringBoard/chronod as all-zero; name it and show its first bytes */
++	if (!mapanon && result == KERN_SUCCESS && (prot & VM_PROT_READ) &&
++	    (strcmp(p->p_comm, "SpringBoard") == 0 || strcmp(p->p_comm, "chronod") == 0)) {
++		static int mmlogged;
++		if (mmlogged++ < 400) {
++			char path[MAXPATHLEN];
++			int plen = sizeof(path);
++			uint64_t w[2] = { 0, 0 };
++			if (vn_getpath(vp, path, &plen) != 0) {
++				strlcpy(path, "?", sizeof(path));
++			}
++			int e = copyin((user_addr_t)(user_addr + pageoff), w, sizeof(w));
++			printf("MMAP %s %s off 0x%llx len 0x%llx size %lld -> %s%llx %llx\n", p->p_comm, path,
++			    (unsigned long long)file_pos, (unsigned long long)user_size,
++			    (long long)ubc_getsize(vp), e ? "E" : "", (unsigned long long)w[0],
++			    (unsigned long long)w[1]);
++		}
++	}
++#endif
+ 	if (!mapanon) {
+ 		(void)vnode_put(vp);
+ 	}
