@@ -1,0 +1,126 @@
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+index 3e1be8e..61638ae 100644
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -39,6 +39,7 @@
+ #include <sys/disk.h>
+ #include <sys/proc.h>
+ #include <kern/locks.h>
++#include <kern/sched_prim.h>
+ #include <libkern/libkern.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+@@ -1177,6 +1178,104 @@ sweet_emmc_probe(void)
+  * Attach controller, validate the card and resolve emmcroot=<name> from
+  * the GPT. 0 on success, errno otherwise. Idempotent.
+  */
++/*
++ * lavender: persistent console log, the layout of the topaz patch 0047, so
++ * tools/sweet-log-pull.sh reads it from OrangeFox: the last 1025 4 KiB blocks
++ * of userdata hold a "SWEETLOG" header block and a 4 MiB ring. The console
++ * ring itself is sweet_ufs.c's (fed by _cnputs); a thread copies new bytes
++ * here about once a second. Off with sweetlog=0. A wedged kernel can lose
++ * its last second, and the eMMC cache is not flushed (shortcut: add CMD6
++ * FLUSH_CACHE if tail lines go missing).
++ */
++#define SEMMC_LOG_RING          (4u << 20)
++extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
++extern uint64_t sweet_log_position(void);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int hz;
++
++static char semmc_log_ring[SEMMC_LOG_RING];
++static int semmc_log_chan;
++
++static void
++semmc_log_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint64_t bytes = (semmc.part.last - semmc.part.first + 1) * SEMMC_SECTOR;
++	uint64_t base = semmc.part.first + (bytes / 4096 - 1025) * (4096 / SEMMC_SECTOR);
++	uint64_t ring = base + 4096 / SEMMC_SECTOR;
++	uint64_t flushed = 0, seq = 0;
++	char tmp[512];
++
++	SEMMC_LOG("console log to the last 4100 KiB of '%s' (lba %llu)", semmc.part.name,
++	    (unsigned long long)base);
++	for (;;) {
++		(void)tsleep(&semmc_log_chan, PZERO, "semmclog", hz);
++		uint64_t total = sweet_log_position();
++		if (total == flushed) {
++			continue;
++		}
++		if (total - flushed > SEMMC_LOG_RING) {
++			flushed = total - SEMMC_LOG_RING;
++		}
++		uint64_t pos = flushed;
++		while (pos < total) {
++			uint64_t at = pos;
++			uint32_t n = sweet_log_copy(&pos, tmp, sizeof(tmp));
++			if (n == 0) {
++				break;
++			}
++			for (uint32_t i = 0; i < n; i++) {
++				semmc_log_ring[(at + i) % SEMMC_LOG_RING] = tmp[i];
++			}
++		}
++		total = pos;
++		uint64_t s = (flushed % SEMMC_LOG_RING) / SEMMC_SECTOR;
++		uint64_t left = (flushed % SEMMC_SECTOR + (total - flushed) + SEMMC_SECTOR - 1) / SEMMC_SECTOR;
++		int error = 0;
++
++		lck_mtx_lock(&semmc_lock);
++		while (left > 0 && !error) {
++			uint64_t n = MIN(left, SEMMC_LOG_RING / SEMMC_SECTOR - s);
++			error = semmc_write_blocks(ring + s, (uint32_t)n, semmc_log_ring + s * SEMMC_SECTOR);
++			left -= n;
++			s = 0;
++		}
++		if (!error) {
++			struct {
++				char magic[8];
++				uint32_t version, size;
++				uint64_t total, seq;
++				char pad[SEMMC_SECTOR - 32];
++			} h = {
++				.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
++				.version = 1, .size = SEMMC_LOG_RING, .total = total, .seq = ++seq,
++			};
++			error = semmc_write_blocks(base, 1, &h);
++		}
++		lck_mtx_unlock(&semmc_lock);
++		if (error) {
++			SEMMC_LOG("console log write failed (%d), stopping", error);
++			return;
++		}
++		flushed = total;
++	}
++}
++
++static void
++semmc_log_start(void)
++{
++	uint32_t on = 1;
++	thread_t thread;
++
++	(void)PE_parse_boot_argn("sweetlog", &on, sizeof(on));
++	if (!on || !semmc_rw || semmc.part.last - semmc.part.first < 4 * 8200) {
++		return;
++	}
++	if (kernel_thread_start(semmc_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
+ int
+ sweet_emmc_init(void)
+ {
+@@ -1228,6 +1327,8 @@ out:
+ 	lck_mtx_unlock(&semmc_lock);
+ 	if (err) {
+ 		SEMMC_LOG("init failed (errno %d)", err);
++	} else {
++		semmc_log_start();
+ 	}
+ 	return err;
+ }
