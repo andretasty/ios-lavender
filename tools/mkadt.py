@@ -37,7 +37,8 @@ FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
 # its live FDT. RAM: the largest System RAM bank 0xa0400000-0x17e4c0000, above ramoops, 32M-aligned.
 LAVENDER = os.environ.get('LAVENDER') == '1'
 if LAVENDER:
-    PHYS_BASE, MEM_SIZE = 0xa2000000, 0xdc000000
+    PHYS_BASE = int(os.environ.get('LAV_MEMBASE', '0xa2000000'), 16)
+    MEM_SIZE = int(os.environ.get('LAV_MEMSIZE', '0xdc000000'), 16)
     GICD, GICR = 0x17a00000, 0x17b00000
     FB, FB_SIZE = 0x9d400000, 0x23ff000
     FB_H = 2340
