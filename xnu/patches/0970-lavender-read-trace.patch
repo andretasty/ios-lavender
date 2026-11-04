@@ -1,0 +1,37 @@
+diff --git a/bsd/kern/sys_generic.c b/bsd/kern/sys_generic.c
+index 66a3528..fc92f71 100644
+--- a/bsd/kern/sys_generic.c
++++ b/bsd/kern/sys_generic.c
+@@ -321,7 +321,32 @@ dofileread(vfs_context_t ctx, struct fileproc *fp,
+ 		return EINVAL;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	int rerr = fp_readv(ctx, fp, uio, flags, retval);
++	/* lavender: dyld rejects some file of SpringBoard/chronod as all-zero; name it and show what read returned */
++	proc_t rp = vfs_context_proc(ctx);
++	if (rp != NULL && FILEGLOB_DTYPE(fp->fp_glob) == DTYPE_VNODE &&
++	    (strcmp(rp->p_comm, "SpringBoard") == 0 || strcmp(rp->p_comm, "chronod") == 0)) {
++		static int rdlogged;
++		if (rdlogged++ < 400) {
++			char path[MAXPATHLEN];
++			int plen = sizeof(path);
++			uint64_t w[2] = { 0, 0 };
++			if (vn_getpath((vnode_t)fp_get_data(fp), path, &plen) != 0) {
++				strlcpy(path, "?", sizeof(path));
++			}
++			if (rerr == 0 && *retval > 0) {
++				(void)copyin(bufp, w, MIN(sizeof(w), (size_t)*retval));
++			}
++			printf("READ %s %s off %lld n %llu -> e%d r%lld %llx %llx\n", rp->p_comm, path,
++			    (flags & FOF_OFFSET) ? (long long)offset : -1LL, (unsigned long long)nbyte, rerr,
++			    (long long)*retval, (unsigned long long)w[0], (unsigned long long)w[1]);
++		}
++	}
++	return rerr;
++#else
+ 	return fp_readv(ctx, fp, uio, flags, retval);
++#endif
+ }
+ 
+ static int
