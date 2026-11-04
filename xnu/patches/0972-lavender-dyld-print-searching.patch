@@ -1,0 +1,32 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 4710f0b..3ebda71 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5869,6 +5869,27 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_envc++;
+ 	}
+ 
++	/* lavender: dyld names the file it rejects as all-zero only when asked to print its searches */
++	if (imgp->ip_ndp != NULL) {
++		const char *nm = imgp->ip_ndp->ni_cnd.cn_nameptr;
++		size_t nl = imgp->ip_ndp->ni_cnd.cn_namelen;
++		if ((nl == 11 && strncmp(nm, "SpringBoard", 11) == 0) || (nl == 7 && strncmp(nm, "chronod", 7) == 0)) {
++			static const char *const dbg[] = { "DYLD_PRINT_SEARCHING=1", "DYLD_PRINT_LIBRARIES=1" };
++			for (size_t i = 0; i < sizeof(dbg) / sizeof(dbg[0]); i++) {
++				error = exec_add_user_string(imgp, CAST_USER_ADDR_T(dbg[i]), UIO_SYSSPACE, TRUE);
++				if (error) {
++					goto bad;
++				}
++				if (imgp->ip_argspace < new_ptr_size) {
++					error = E2BIG;
++					goto bad;
++				}
++				imgp->ip_argspace -= new_ptr_size;
++				imgp->ip_envc++;
++			}
++		}
++	}
++
+ 	/* topaz: one more variable for the programs that get our library (see exec_inject_env) */
+ 	if (exec_inject_env(imgp, inject_env, sizeof(inject_env))) {
+ 		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(inject_env), UIO_SYSSPACE, TRUE);
