@@ -13,10 +13,10 @@ index c2864ab..d7912b1 100644
  bsd/dev/redwood_apple80211.c	standard
 diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
 new file mode 100644
-index 0000000..2b45cf3
+index 0000000..83e2949
 --- /dev/null
 +++ b/bsd/dev/sweet_emmc.c
-@@ -0,0 +1,1198 @@
+@@ -0,0 +1,1208 @@
 +/*
 + * sweet_emmc.c - polled SDHCI / eMMC read-only root driver
 + *                Xiaomi Redmi Pad SE (SM6225 "khaje", SDCC1 @ 0x04744000)
@@ -545,10 +545,20 @@ index 0000000..2b45cf3
 +			SEMMC_UDELAY(1);
 +		}
 +		semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_DATA_AVAIL);
++		if (trace && b == 0) {
++			SEMMC_LOG("xfer: data available, INT=0x%08x PS=0x%08x", st,
++			    semmc_r32(SDHCI_PRESENT_STATE));
++		}
 +		for (uint32_t w = 0; w < SEMMC_SECTOR / 4; w++) {
 +			uint32_t v = semmc_r32(SDHCI_BUFFER);
++			if (trace && b == 0 && w == 0) {
++				SEMMC_LOG("xfer: first word 0x%08x PS=0x%08x", v, semmc_r32(SDHCI_PRESENT_STATE));
++			}
 +			memcpy(out, &v, sizeof(v));
 +			out += sizeof(v);
++		}
++		if (trace && b == 0) {
++			SEMMC_LOG("xfer: block read, PS=0x%08x", semmc_r32(SDHCI_PRESENT_STATE));
 +		}
 +	}
 +
