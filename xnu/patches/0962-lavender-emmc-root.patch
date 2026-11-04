@@ -13,10 +13,10 @@ index c2864ab..d7912b1 100644
  bsd/dev/redwood_apple80211.c	standard
 diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
 new file mode 100644
-index 0000000..8d7d4c9
+index 0000000..e928732
 --- /dev/null
 +++ b/bsd/dev/sweet_emmc.c
-@@ -0,0 +1,1229 @@
+@@ -0,0 +1,1275 @@
 +/*
 + * sweet_emmc.c - polled SDHCI / eMMC read-only root driver
 + *                Xiaomi Redmi Pad SE (SM6225 "khaje", SDCC1 @ 0x04744000)
@@ -89,6 +89,23 @@ index 0000000..8d7d4c9
 +	}
 +}
 +#define SEMMC_UDELAY(us) semmc_udelay(us)
++
++/*
++ * lavender: the sdhci-msm v5 buffer data port reads back zeros and never
++ * drains (BUF_RD_EN stays set), so reads go through SDMA instead: one 64 KiB
++ * physically contiguous bounce buffer below 4 GiB, 64 KiB aligned so a
++ * transfer never crosses the 512 KiB SDMA boundary.
++ */
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++#define SEMMC_DMA_SIZE          0x10000u
++#define SDHCI_SDMA_ADDRESS      0x00
++#define SDHCI_TM_DMA            0x0001u
++#define SDHCI_INT_DMA           0x00000008u
++static vm_offset_t semmc_dma;
++static uint64_t semmc_dma_pa;
 +
 +/* ------------------------------------------------------------------ */
 +/* Constants                                                           */
@@ -513,6 +530,13 @@ index 0000000..8d7d4c9
 +		traced++;
 +		SEMMC_LOG("xfer CMD%u arg=0x%x nblk=%u: block regs", idx, arg, nblk);
 +	}
++	int dma = semmc_dma_pa != 0 && nblk * SEMMC_SECTOR <= SEMMC_DMA_SIZE;
++	if (dma) {
++		flush_dcache64((addr64_t)semmc_dma_pa, nblk * SEMMC_SECTOR, TRUE);
++		semmc_w32(SDHCI_SDMA_ADDRESS, (uint32_t)semmc_dma_pa);
++		semmc_w8(SDHCI_HOST_CONTROL, semmc_r8(SDHCI_HOST_CONTROL) & (uint8_t)~0x18u);  /* SDMA */
++		mode |= SDHCI_TM_DMA;
++	}
 +	semmc_w32(SDHCI_BLOCK_SIZE, ((uint32_t)nblk << 16) | 0x7000u | SEMMC_SECTOR);
 +	semmc_w8(SDHCI_TIMEOUT_CONTROL, 0xE);
 +	if (trace) {
@@ -536,7 +560,7 @@ index 0000000..8d7d4c9
 +		return EIO;
 +	}
 +
-+	for (uint32_t b = 0; b < nblk; b++) {
++	for (uint32_t b = 0; !dma && b < nblk; b++) {
 +		for (uint32_t t = 0;; t++) {
 +			st = semmc_r32(SDHCI_INT_STATUS);
 +			if (st & SDHCI_INT_ERR_MASK) {
@@ -600,7 +624,16 @@ index 0000000..8d7d4c9
 +		}
 +		SEMMC_UDELAY(1);
 +	}
-+	semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_XFER_COMPLETE | SDHCI_INT_DATA_AVAIL);
++	semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_XFER_COMPLETE | SDHCI_INT_DATA_AVAIL | SDHCI_INT_DMA);
++	if (dma) {
++		flush_dcache64((addr64_t)semmc_dma_pa, nblk * SEMMC_SECTOR, TRUE);
++		memcpy(out, (const void *)semmc_dma, nblk * SEMMC_SECTOR);
++		if (trace) {
++			const uint32_t *w = (const uint32_t *)semmc_dma;
++			SEMMC_LOG("xfer: SDMA done, words 0=0x%08x 48=0x%08x 53=0x%08x 127=0x%08x",
++			    w[0], w[48], w[53], w[127]);
++		}
++	}
 +	return 0;
 +}
 +
@@ -925,6 +958,19 @@ index 0000000..8d7d4c9
 +				gicd[(0x180 / 4) + n] = bit;    /* GICD_ICENABLER */
 +				gicd[(0x280 / 4) + n] = bit;    /* GICD_ICPENDR */
 +			}
++		}
++	}
++
++	if (semmc_dma == 0) {
++		if (kmem_alloc_contig(kernel_map, &semmc_dma, SEMMC_DMA_SIZE, SEMMC_DMA_SIZE - 1,
++		    (ppnum_t)((0x100000000ULL >> PAGE_SHIFT) - 1), 0,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
++			semmc_dma_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)semmc_dma));
++		}
++		SEMMC_LOG("SDMA bounce va=0x%lx pa=0x%llx", (unsigned long)semmc_dma,
++		    (unsigned long long)semmc_dma_pa);
++		if (semmc_dma_pa == 0 || semmc_dma_pa + SEMMC_DMA_SIZE > 0x100000000ULL) {
++			semmc_dma_pa = 0;
 +		}
 +	}
 +
