@@ -13,10 +13,10 @@ index c2864ab..d7912b1 100644
  bsd/dev/redwood_apple80211.c	standard
 diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
 new file mode 100644
-index 0000000..e928732
+index 0000000..c87e5b5
 --- /dev/null
 +++ b/bsd/dev/sweet_emmc.c
-@@ -0,0 +1,1275 @@
+@@ -0,0 +1,1287 @@
 +/*
 + * sweet_emmc.c - polled SDHCI / eMMC read-only root driver
 + *                Xiaomi Redmi Pad SE (SM6225 "khaje", SDCC1 @ 0x04744000)
@@ -92,16 +92,20 @@ index 0000000..e928732
 +
 +/*
 + * lavender: the sdhci-msm v5 buffer data port reads back zeros and never
-+ * drains (BUF_RD_EN stays set), so reads go through SDMA instead: one 64 KiB
-+ * physically contiguous bounce buffer below 4 GiB, 64 KiB aligned so a
-+ * transfer never crosses the 512 KiB SDMA boundary.
++ * drains (BUF_RD_EN stays set), and the host has no SDMA (CAPS bit 22 = 0;
++ * enabling DMA ran ABL's stale ADMA descriptors over kernel memory). Reads go
++ * through 64-bit ADMA2 (CAPS bit 19, HOST_CONTROL DMA select 3, as ABL left
++ * it) with one descriptor: a 64 KiB physically contiguous bounce buffer and,
++ * right behind it, the descriptor itself.
 + */
 +#include <vm/pmap.h>
 +#include <vm/vm_kern.h>
 +#include <arm/caches_internal.h>
 +extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 +#define SEMMC_DMA_SIZE          0x10000u
-+#define SDHCI_SDMA_ADDRESS      0x00
++#define SEMMC_DMA_ALLOC         (SEMMC_DMA_SIZE + 0x4000u)
++#define SDHCI_ADMA_ADDRESS      0x58
++#define SDHCI_ADMA_ADDRESS_HI   0x5C
 +#define SDHCI_TM_DMA            0x0001u
 +#define SDHCI_INT_DMA           0x00000008u
 +static vm_offset_t semmc_dma;
@@ -532,9 +536,17 @@ index 0000000..e928732
 +	}
 +	int dma = semmc_dma_pa != 0 && nblk * SEMMC_SECTOR <= SEMMC_DMA_SIZE;
 +	if (dma) {
-+		flush_dcache64((addr64_t)semmc_dma_pa, nblk * SEMMC_SECTOR, TRUE);
-+		semmc_w32(SDHCI_SDMA_ADDRESS, (uint32_t)semmc_dma_pa);
-+		semmc_w8(SDHCI_HOST_CONTROL, semmc_r8(SDHCI_HOST_CONTROL) & (uint8_t)~0x18u);  /* SDMA */
++		/* one 64-bit ADMA2 descriptor: attr valid|end|tran, length (0 = 64 KiB), address */
++		volatile uint32_t *desc = (volatile uint32_t *)(semmc_dma + SEMMC_DMA_SIZE);
++		uint64_t desc_pa = semmc_dma_pa + SEMMC_DMA_SIZE;
++		desc[0] = 0x0023u | (((nblk * SEMMC_SECTOR) & 0xFFFFu) << 16);
++		desc[1] = (uint32_t)semmc_dma_pa;
++		desc[2] = (uint32_t)(semmc_dma_pa >> 32);
++		desc[3] = 0;
++		flush_dcache64((addr64_t)semmc_dma_pa, SEMMC_DMA_ALLOC, TRUE);
++		semmc_w32(SDHCI_ADMA_ADDRESS, (uint32_t)desc_pa);
++		semmc_w32(SDHCI_ADMA_ADDRESS_HI, (uint32_t)(desc_pa >> 32));
++		semmc_w8(SDHCI_HOST_CONTROL, semmc_r8(SDHCI_HOST_CONTROL) | 0x18u);    /* ADMA2 64-bit */
 +		mode |= SDHCI_TM_DMA;
 +	}
 +	semmc_w32(SDHCI_BLOCK_SIZE, ((uint32_t)nblk << 16) | 0x7000u | SEMMC_SECTOR);
@@ -962,14 +974,14 @@ index 0000000..e928732
 +	}
 +
 +	if (semmc_dma == 0) {
-+		if (kmem_alloc_contig(kernel_map, &semmc_dma, SEMMC_DMA_SIZE, SEMMC_DMA_SIZE - 1,
++		if (kmem_alloc_contig(kernel_map, &semmc_dma, SEMMC_DMA_ALLOC, PAGE_MASK,
 +		    (ppnum_t)((0x100000000ULL >> PAGE_SHIFT) - 1), 0,
 +		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
 +			semmc_dma_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)semmc_dma));
 +		}
 +		SEMMC_LOG("SDMA bounce va=0x%lx pa=0x%llx", (unsigned long)semmc_dma,
 +		    (unsigned long long)semmc_dma_pa);
-+		if (semmc_dma_pa == 0 || semmc_dma_pa + SEMMC_DMA_SIZE > 0x100000000ULL) {
++		if (semmc_dma_pa == 0 || semmc_dma_pa + SEMMC_DMA_ALLOC > 0x100000000ULL) {
 +			semmc_dma_pa = 0;
 +		}
 +	}
