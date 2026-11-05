@@ -1,0 +1,121 @@
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 48866e2..c13838c 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -656,46 +656,61 @@ smmu_fault(const char *tag)
+ 	    rd(smmu, SMMU_CB0 + 0x58), rd(smmu, SMMU_CB0 + 0x64), rd(smmu, SMMU_CB0 + 0x60), rd(smmu, SMMU_CB0 + 0x68));
+ }
+ 
++/* Each write waits to complete and says so: a stuck write names itself in the log. */
++static void
++smmu_step(uint32_t o, uint32_t v)
++{
++	IOLog("TopazGPU: smmu %#x <- %08x\n", o, v);
++	wr(smmu, o, v);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	IOLog("TopazGPU: smmu %#x = %08x\n", o, rd(smmu, o));
++}
++
++/*
++ * The stock SMMU comes up already set by TrustZone (qcom,skip-init): unmatched streams fault, S2CR0
++ * type fault. GPU VA = PA here, so nothing has to translate. Boot-arg gpu_smmu: 1 (default) SID 0
++ * bypasses through S2CR0 and SMR0; 2 the context bank with tables (topaz); 3 sCR0.CLIENTPD, the whole
++ * SMMU out of the way; 0 touch nothing.
++ */
++static uint32_t gpu_smmu = 1;
++
+ static bool
+ smmu_setup(void)
+ {
+-	IOLog("TopazGPU: smmu: tables\n");
+-	if (l1.va == NULL && !table_alloc(&l1)) {
+-		return false;
++	IOLog("TopazGPU: smmu mode %u: idr0 %08x sCR0 %08x S2CR0 %08x SMR0 %08x CB0 sctlr %08x gfsr %08x\n", gpu_smmu,
++	    rd(smmu, 0x20), rd(smmu, 0x0), rd(smmu, 0xC00), rd(smmu, 0x800), rd(smmu, SMMU_CB0), rd(smmu, 0x48));
++	switch (gpu_smmu) {
++	case 0:
++		break;
++	case 3:
++		smmu_step(0x0, rd(smmu, 0x0) | 1u);
++		break;
++	case 2:
++		if (l1.va == NULL && !table_alloc(&l1)) {
++			return false;
++		}
++		smmu_step(SMMU_CB0 + 0x000, 0);                 /* SCTLR off while programming */
++		smmu_step(SMMU_CB0 + 0x058, 0xFFFFFFFF);        /* FSR clear */
++		smmu_step(0x1000 + 0x800, 1);                   /* CBA2R0: AArch64 descriptors */
++		smmu_step(0x1000, 0x0001f000);                  /* CBAR0: S1 translate, S2 bypass */
++		smmu_step(SMMU_CB0 + 0x020, (uint32_t)l1.pa);
++		smmu_step(SMMU_CB0 + 0x024, (uint32_t)(l1.pa >> 32));
++		smmu_step(SMMU_CB0 + 0x030, 32 | (1u << 23));   /* TCR: T0SZ 32, 4 KB, NC walks, EPD1 */
++		smmu_step(SMMU_CB0 + 0x010, 1);                 /* TCR2: PASize 36 bits */
++		smmu_step(SMMU_CB0 + 0x038, 0x44);              /* MAIR0: attr0 = Normal non-cacheable */
++		smmu_step(SMMU_CB0 + 0x03C, 0);
++		smmu_step(SMMU_CB0 + 0x000, gpu_identity ? 0xE0 : 0x67);    /* SCTLR */
++		smmu_step(0xC00, 0);                            /* S2CR0 -> CB0 */
++		smmu_step(0x800, (1u << 31) | (1u << 16));      /* SMR0: SID 0 mask 1 */
++		smmu_on = true;
++		tlb_flush();
++		break;
++	default:
++		smmu_step(0xC00, 1u << 16);                     /* S2CR0: bypass */
++		smmu_step(0x800, (1u << 31) | (1u << 16));      /* SMR0: SID 0 mask 1 */
++		break;
+ 	}
+-	IOLog("TopazGPU: smmu: tables at %#llx; idr0 %08x sCR0 %08x S2CR0 %08x SMR0 %08x CB0 sctlr %08x\n", l1.pa,
+-	    rd(smmu, 0x20), rd(smmu, 0x0), rd(smmu, 0xC00), rd(smmu, 0x800), rd(smmu, SMMU_CB0));
+-	IOLog("TopazGPU: smmu wr %s\n", "SMMU_CB0 + 0x000");
+-	wr(smmu, SMMU_CB0 + 0x000, 0);                  /* SCTLR off while programming */
+-	IOLog("TopazGPU: smmu wr %s\n", "SMMU_CB0 + 0x058");
+-	wr(smmu, SMMU_CB0 + 0x058, 0xFFFFFFFF);         /* FSR clear */
+-	IOLog("TopazGPU: smmu wr %s\n", "0x1000 + 0x800");
+-	wr(smmu, 0x1000 + 0x800, 1);                    /* CBA2R0: AArch64 descriptors */
+-	IOLog("TopazGPU: smmu wr %s\n", "0x1000");
+-	wr(smmu, 0x1000, 0x0001f000);                   /* CBAR0: S1 translate, S2 bypass */
+-	IOLog("TopazGPU: smmu wr %s\n", "SMMU_CB0 + 0x020");
+-	wr(smmu, SMMU_CB0 + 0x020, (uint32_t)l1.pa);
+-	IOLog("TopazGPU: smmu wr %s\n", "SMMU_CB0 + 0x024");
+-	wr(smmu, SMMU_CB0 + 0x024, (uint32_t)(l1.pa >> 32));
+-	IOLog("TopazGPU: smmu wr %s\n", "SMMU_CB0 + 0x030");
+-	wr(smmu, SMMU_CB0 + 0x030, 32 | (1u << 23));    /* TCR: T0SZ 32, 4 KB, NC walks, EPD1 */
+-	IOLog("TopazGPU: smmu wr %s\n", "SMMU_CB0 + 0x010");
+-	wr(smmu, SMMU_CB0 + 0x010, 1);                  /* TCR2: PASize 36 bits */
+-	IOLog("TopazGPU: smmu wr %s\n", "SMMU_CB0 + 0x038");
+-	wr(smmu, SMMU_CB0 + 0x038, 0x44);               /* MAIR0: attr0 = Normal non-cacheable */
+-	IOLog("TopazGPU: smmu wr %s\n", "SMMU_CB0 + 0x03C");
+-	wr(smmu, SMMU_CB0 + 0x03C, 0);
+-	IOLog("TopazGPU: smmu wr %s\n", "SMMU_CB0 + 0x000");
+-	wr(smmu, SMMU_CB0 + 0x000, gpu_identity ? 0xE0 : 0x67);    /* SCTLR: M=0 pass-through, or CFIE CFRE AFE TRE M */
+-	IOLog("TopazGPU: smmu wr %s\n", "0xC00");
+-	wr(smmu, 0xC00, 0);                             /* S2CR0 -> CB0 */
+-	IOLog("TopazGPU: smmu wr %s\n", "0x800");
+-	wr(smmu, 0x800, (1u << 31) | (1u << 16));       /* SMR0: SID 0 mask 1 */
+-	smmu_on = true;
+-	tlb_flush();
+-	IOLog("TopazGPU: SMMU TTBR0 %08x%08x SCTLR %08x TCR %08x TCR2 %08x IDR0 %08x IDR2 %08x sCR0 %08x%s\n",
+-	    rd(smmu, SMMU_CB0 + 0x24), rd(smmu, SMMU_CB0 + 0x20), rd(smmu, SMMU_CB0), rd(smmu, SMMU_CB0 + 0x30),
+-	    rd(smmu, SMMU_CB0 + 0x10), rd(smmu, 0x20), rd(smmu, 0x28), rd(smmu, 0x0), gpu_identity ? " (identity)" : "");
++	IOLog("TopazGPU: smmu done: sCR0 %08x S2CR0 %08x SMR0 %08x gfsr %08x\n", rd(smmu, 0x0), rd(smmu, 0xC00), rd(smmu, 0x800), rd(smmu, 0x48));
+ 	return true;
+ }
+ 
+@@ -928,7 +943,9 @@ cp_start(void)
+ 		return false;
+ 	}
+ 	IOLog("TopazGPU: cp: PM4 at GPU %#llx, PFP %#llx, ring %#llx, mem %#llx\n", pm4.iova, pfp.iova, ring.iova, mem.iova);
+-	tlb_flush();
++	if (smmu_on) {
++		tlb_flush();
++	}
+ 	hw_init_regs();
+ 	gpu_wr64(0x838, pm4.iova);                      /* CP_ME_INSTR_BASE */
+ 	gpu_wr64(0x835, pfp.iova);                      /* CP_PFP_INSTR_BASE */
+@@ -1233,6 +1250,7 @@ topaz_adreno_init(void)
+ 		return;
+ 	}
+ 	(void)PE_parse_boot_argn("gpu_step", &gpu_step, sizeof(gpu_step));
++	(void)PE_parse_boot_argn("gpu_smmu", &gpu_smmu, sizeof(gpu_smmu));
+ 	(void)PE_parse_boot_argn("gpu_identity", &gpu_identity, sizeof(gpu_identity));
+ 	(void)PE_parse_boot_argn("gpu_midmem", &gpu_midmem, sizeof(gpu_midmem));
+ 	hw_lock = IOLockAlloc();
