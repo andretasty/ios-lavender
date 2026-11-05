@@ -1,0 +1,41 @@
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 98c4fd5..4c9b53c 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -269,12 +269,14 @@ topaz_gpu_pool_alloc(uint64_t size, void **va)
+ 	}
+ 	unsigned c = (unsigned)((pa - GPU_POOL_BASE) / GPU_POOL_CHUNK);
+ 	if (gpu_chunk_va[c] == NULL) {
++		IOLog("TopazGPU: pool: mapping chunk %u at %#llx\n", c, GPU_POOL_BASE + c * GPU_POOL_CHUNK);
+ 		/* in the kernel map, not the small IO submap ml_io_map uses (64 MB there failed) */
+ 		IOMemoryDescriptor *md = topaz_gpu_pool_md(GPU_POOL_BASE + c * GPU_POOL_CHUNK, GPU_POOL_CHUNK);
+ 		IOMemoryMap *map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
+ 		if (map != NULL) {
+ 			gpu_chunk_va[c] = (uint8_t *)map->getVirtualAddress();     /* (kept for good, with md) */
+ 		}
++		IOLog("TopazGPU: pool: chunk %u mapped at %p\n", c, gpu_chunk_va[c]);
+ 		if (gpu_chunk_va[c] == NULL) {
+ 			OSSafeReleaseNULL(map);
+ 			OSSafeReleaseNULL(md);
+@@ -320,10 +322,12 @@ kbuf_alloc_low(struct kbuf *b, uint64_t size)
+ 	}
+ 	b->va = (uint8_t *)va;
+ 	b->size = size;
++	IOLog("TopazGPU: kbuf: pa %#llx va %p size %#llx, zeroing\n", b->pa, b->va, size);
+ 	for (uint64_t i = 0; i < size; i += 8) {
+ 		*(volatile uint64_t *)(b->va + i) = 0;
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
++	IOLog("TopazGPU: kbuf: zeroed\n");
+ 	return true;
+ }
+ 
+@@ -659,6 +663,8 @@ smmu_setup(void)
+ 	if (l1.va == NULL && !table_alloc(&l1)) {
+ 		return false;
+ 	}
++	IOLog("TopazGPU: smmu: tables at %#llx; idr0 %08x sCR0 %08x S2CR0 %08x SMR0 %08x CB0 sctlr %08x\n", l1.pa,
++	    rd(smmu, 0x20), rd(smmu, 0x0), rd(smmu, 0xC00), rd(smmu, 0x800), rd(smmu, SMMU_CB0));
+ 	wr(smmu, SMMU_CB0 + 0x000, 0);                  /* SCTLR off while programming */
+ 	wr(smmu, SMMU_CB0 + 0x058, 0xFFFFFFFF);         /* FSR clear */
+ 	wr(smmu, 0x1000 + 0x800, 1);                    /* CBA2R0: AArch64 descriptors */
