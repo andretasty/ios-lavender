@@ -1,0 +1,50 @@
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 13d537c..eee3c98 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -884,6 +884,22 @@ ring_free(void)
+ 	return (r + RB_DWORDS - w - 1) % RB_DWORDS;
+ }
+ 
++/* What the CP and the bus interface are doing (a5xx_dump, a5xx.xml). */
++static void
++cp_dump(void)
++{
++	IOLog("TopazGPU: VBIF version %08x clkon %08x halt0 %08x halt1 %08x | RBBM_STATUS3 %08x CP_CNTL %08x PFP_ME_CNTL %08x RB_BASE %08x%08x RB_CNTL %08x\n",
++	    gpu_rd(0x3000), gpu_rd(0x3001), gpu_rd(0x3080), gpu_rd(0x3081), gpu_rd(0x530), gpu_rd(0x831), gpu_rd(0x832), gpu_rd(0x801), gpu_rd(0x800), gpu_rd(0x802));
++	IOLog("TopazGPU: ME base %08x%08x PFP base %08x%08x ring[0] %08x pm4[0] %08x pfp[0] %08x\n", gpu_rd(0x839), gpu_rd(0x838), gpu_rd(0x836), gpu_rd(0x835),
++	    ring.va ? *(volatile uint32_t *)ring.va : 0, pm4.va ? *(volatile uint32_t *)pm4.va : 0, pfp.va ? *(volatile uint32_t *)pfp.va : 0);
++	for (uint32_t i = 0; i < 8; i++) {
++		gpu_wr(0x808, i);
++		uint32_t pf = gpu_rd(0x809);
++		gpu_wr(0x81a, i);
++		IOLog("TopazGPU: stat %u: PFP %08x ME %08x\n", i, pf, gpu_rd(0xb14));
++	}
++}
++
+ static bool
+ ring_idle(uint32_t ms)
+ {
+@@ -898,6 +914,7 @@ ring_idle(uint32_t ms)
+ 	IOLog("TopazGPU: CB0 sctlr %08x ttbr %08x tcr %08x FSRRESTORE %08x\n", rd(smmu, SMMU_CB0), rd(smmu, SMMU_CB0 + 0x20),
+ 	    rd(smmu, SMMU_CB0 + 0x30), rd(smmu, SMMU_CB0 + 0x5c));
+ 	smmu_fault("ring");
++	cp_dump();
+ 	return false;
+ }
+ 
+@@ -1026,6 +1043,14 @@ cp_start(void)
+ 	if (smmu_on) {
+ 		tlb_flush();
+ 	}
++	uint32_t swreset = 0;
++	(void)PE_parse_boot_argn("gpu_swreset", &swreset, sizeof(swreset));
++	if (swreset) {
++		gpu_wr(0x43, 1);                                /* RBBM_SW_RESET_CMD (a5xx_recover) */
++		(void)gpu_rd(0x43);
++		gpu_wr(0x43, 0);
++		IODelay(100);
++	}
+ 	hw_init_regs();
+ 	gpu_wr64(0x838, pm4.iova);                      /* CP_ME_INSTR_BASE */
+ 	gpu_wr64(0x835, pfp.iova);                      /* CP_PFP_INSTR_BASE */
