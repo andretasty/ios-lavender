@@ -1,0 +1,52 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 7b9a9f5..3f367e2 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -365,6 +365,25 @@ AppleCLCD::start(IOService *provider)
+ 	fVig0 = mdss ? (volatile uint32_t *)ml_io_map(mdss + 0x5000, 0x1000) : NULL;
+ 	fCtl0 = mdss ? (volatile uint32_t *)ml_io_map(mdss + 0x2000, 0x1000) : NULL;
+ 	topaz_adreno_init();
++	{
++		/* lavender: read how ABL left the MDP5 (mdp_probe=1). Only reads. */
++		uint32_t probe = 0;
++		if (PE_parse_boot_argn("mdp_probe", &probe, sizeof(probe)) && probe) {
++			static const uint32_t pipes[] = { 0x5000, 0x7000, 0x9000, 0xb000, 0x15000, 0x17000, 0x19000, 0x25000, 0x27000 };
++			volatile uint8_t *m = (volatile uint8_t *)ml_io_map(0x0c900000, 0x30000);
++			if (m != NULL) {
++				IOLog("MDP: hw version %08x top %08x ctl0 flush %08x top %08x lm0 %08x | ctl1 flush %08x top %08x\n", *(volatile uint32_t *)m,
++				    *(volatile uint32_t *)(m + 0x1000), *(volatile uint32_t *)(m + 0x2018), *(volatile uint32_t *)(m + 0x2014), *(volatile uint32_t *)(m + 0x2000),
++				    *(volatile uint32_t *)(m + 0x2218), *(volatile uint32_t *)(m + 0x2214));
++				for (unsigned i = 0; i < sizeof(pipes) / sizeof(pipes[0]); i++) {
++					volatile uint8_t *b = m + pipes[i];
++					IOLog("MDP: pipe %#x size %08x out %08x src0 %08x stride %08x fmt %08x unpack %08x op %08x\n", pipes[i],
++					    *(volatile uint32_t *)(b + 0x00), *(volatile uint32_t *)(b + 0x0c), *(volatile uint32_t *)(b + 0x14), *(volatile uint32_t *)(b + 0x24),
++					    *(volatile uint32_t *)(b + 0x30), *(volatile uint32_t *)(b + 0x34), *(volatile uint32_t *)(b + 0x38));
++				}
++			}
++		}
++	}
+ 	setProperty("RedwoodWaitsForGPU", true);         /* present() waits for the GPU (eagl.c reads it) */
+ 	fDsi = mdss ? (volatile uint8_t *)ml_io_map(mdss + 0x94000, 0x1000) : NULL;
+ 	fDsiBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index eee3c98..7a7dc1c 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -426,7 +426,7 @@ power_up(void)
+ 		return false;
+ 	}
+ 	/* gfx3d: GPLL0 / 2. The GX voltage corner is not voted: stays on what the bootloader left. */
+-	if (!rcg_set(0x1070, SRC_GPLL0, 2)) {
++	if (!rcg_set(0x1070, SRC_GPLL0, core_mhz >= 600 ? 1 : 2)) {
+ 		IOLog("TopazGPU: gfx3d RCG stuck\n");
+ 		return false;
+ 	}
+@@ -1355,6 +1355,8 @@ topaz_adreno_init(void)
+ 		return;
+ 	}
+ 	(void)PE_parse_boot_argn("gpu_step", &gpu_step, sizeof(gpu_step));
++	(void)PE_parse_boot_argn("gpu_mhz", &core_mhz, sizeof(core_mhz));       /* 300 or 600 (GPLL0 / 2, / 1) */
++	core_mhz = core_mhz >= 600 ? 600 : 300;
+ 	(void)PE_parse_boot_argn("gpu_log", &gpu_log, sizeof(gpu_log));
+ 	(void)PE_parse_boot_argn("gpu_smmu", &gpu_smmu, sizeof(gpu_smmu));
+ 	(void)PE_parse_boot_argn("gpu_identity", &gpu_identity, sizeof(gpu_identity));
