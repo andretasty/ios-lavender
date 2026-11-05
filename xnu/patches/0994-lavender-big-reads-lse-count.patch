@@ -1,0 +1,173 @@
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+index b6ccb2f..14ac2f5 100644
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -84,7 +84,7 @@ semmc_udelay(uint32_t us)
+ #include <vm/vm_kern.h>
+ #include <arm/caches_internal.h>
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+-#define SEMMC_DMA_SIZE          0x10000u
++#define SEMMC_DMA_SIZE          0x100000u       /* lavender: 1 MB, one read in up to 18 ADMA2 descriptors */
+ #define SEMMC_DMA_ALLOC         (SEMMC_DMA_SIZE + 0x4000u)
+ #define SDHCI_ADMA_ADDRESS      0x58
+ #define SDHCI_ADMA_ADDRESS_HI   0x5C
+@@ -486,20 +486,36 @@ semmc_abort(void)
+ }
+ 
+ /*
+- * One 64-bit ADMA2 descriptor right behind the bounce buffer: attr
+- * valid|end|tran, length (nblk * 512, < 64 KiB), address. Points the host at it.
++ * 64-bit ADMA2 descriptors right behind the bounce buffer: attr valid|tran (end
++ * on the last), length, address. Points the host at them. 60 KB each: a length
++ * of 64 KB would be written as 0. Only the bytes in use go through the cache:
++ * cleaning the whole buffer for every command was most of a small read's cost.
++ * The stride is proved by semmc_big_read_test before more than one is used.
+  */
++#define SEMMC_DESC_CHUNK        0xF000u
++static uint32_t semmc_desc_stride = 12;
++static uint32_t semmc_read_max = SEMMC_MAX_XFER_BLKS;
++
+ static void
+ semmc_adma_arm(uint32_t nblk)
+ {
+-	volatile uint32_t *desc = (volatile uint32_t *)(semmc_dma + SEMMC_DMA_SIZE);
+-	uint64_t desc_pa = semmc_dma_pa + SEMMC_DMA_SIZE;
+-
+-	desc[0] = 0x0023u | (((nblk * SEMMC_SECTOR) & 0xFFFFu) << 16);
+-	desc[1] = (uint32_t)semmc_dma_pa;
+-	desc[2] = (uint32_t)(semmc_dma_pa >> 32);
+-	desc[3] = 0;
+-	flush_dcache64((addr64_t)semmc_dma_pa, SEMMC_DMA_ALLOC, TRUE);
++	volatile uint8_t *desc = (volatile uint8_t *)(semmc_dma + SEMMC_DMA_SIZE);
++	uint64_t desc_pa = semmc_dma_pa + SEMMC_DMA_SIZE, pa = semmc_dma_pa;
++	uint32_t left = nblk * SEMMC_SECTOR, used = 0;
++
++	while (left > 0) {
++		uint32_t n = left > SEMMC_DESC_CHUNK ? SEMMC_DESC_CHUNK : left;
++		volatile uint32_t *d = (volatile uint32_t *)(desc + used);
++		left -= n;
++		d[0] = (left == 0 ? 0x0023u : 0x0021u) | (n << 16);
++		d[1] = (uint32_t)pa;
++		d[2] = (uint32_t)(pa >> 32);
++		d[3] = 0;
++		pa += n;
++		used += semmc_desc_stride;
++	}
++	flush_dcache64((addr64_t)semmc_dma_pa, nblk * SEMMC_SECTOR, TRUE);
++	flush_dcache64((addr64_t)desc_pa, used + 16, TRUE);
+ 	semmc_w32(SDHCI_ADMA_ADDRESS, (uint32_t)desc_pa);
+ 	semmc_w32(SDHCI_ADMA_ADDRESS_HI, (uint32_t)(desc_pa >> 32));
+ 	semmc_w8(SDHCI_HOST_CONTROL, semmc_r8(SDHCI_HOST_CONTROL) | 0x18u);    /* ADMA2 64-bit */
+@@ -658,7 +674,7 @@ semmc_read_blocks(uint64_t lba, uint32_t nblk, void *dst)
+ 		return EINVAL;  /* eMMC block addressing is 32 bit */
+ 	}
+ 	while (nblk > 0) {
+-		uint32_t n = nblk > SEMMC_MAX_XFER_BLKS ? SEMMC_MAX_XFER_BLKS : nblk;
++		uint32_t n = nblk > semmc_read_max ? semmc_read_max : nblk;
+ 
+ 		err = semmc_xfer_read(n > 1 ? MMC_READ_MULTIPLE_BLOCK :
+ 		    MMC_READ_SINGLE_BLOCK, (uint32_t)lba, n, out);
+@@ -1263,6 +1279,42 @@ semmc_log_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ }
+ 
++/*
++ * lavender: reads of up to 1 MB only after this proves them: the same MiB read in 32 KB commands and in
++ * one, byte for byte, with each descriptor stride. Writes stay at 32 KB. Called with semmc_lock held.
++ */
++static void
++semmc_big_read_test(void)
++{
++	static const uint32_t strides[] = { 12, 16 };
++	const uint32_t blocks = SEMMC_DMA_SIZE / SEMMC_SECTOR;
++	uint64_t lba = semmc.part.first + 4000000;
++	char *a = semmc_log_ring, *b = semmc_log_ring + SEMMC_DMA_SIZE;
++
++	if (semmc_dma_pa == 0 || semmc_read_blocks(lba, blocks, a) != 0) {
++		SEMMC_LOG("big reads: reference read failed, staying at 32 KB");
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(strides) / sizeof(strides[0]); i++) {
++		semmc_desc_stride = strides[i];
++		bzero(b, SEMMC_DMA_SIZE);
++		uint64_t t0 = mach_absolute_time(), ns;
++		int err = semmc_xfer_read(MMC_READ_MULTIPLE_BLOCK, (uint32_t)lba, blocks, b);
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		int same = err == 0 && memcmp(a, b, SEMMC_DMA_SIZE) == 0;
++		SEMMC_LOG("big read test: stride %u err %d same %d, 1 MB in %llu us", strides[i], err, same, ns / 1000);
++		if (same) {
++			semmc_read_max = blocks;
++			break;
++		}
++	}
++	if (semmc_read_max == SEMMC_MAX_XFER_BLKS) {
++		semmc_desc_stride = 12;
++		SEMMC_LOG("big reads refused, staying at 32 KB");
++	}
++	bzero(a, 2 * SEMMC_DMA_SIZE);
++}
++
+ static void
+ semmc_log_start(void)
+ {
+@@ -1325,6 +1377,7 @@ sweet_emmc_init(void)
+ 	    (unsigned long long)((semmc.part.last - semmc.part.first + 1) / 2048),
+ 	    semmc_rw ? "read-write" : "read-only");
+ 	semmc.ready = 1;
++	semmc_big_read_test();
+ out:
+ 	lck_mtx_unlock(&semmc_lock);
+ 	if (err) {
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 281f7c4..c69fed1 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -1327,6 +1327,7 @@ extern uint64_t semmc_rd_bytes, semmc_rd_abs, semmc_wr_bytes, semmc_wr_abs;
+ extern uint64_t sweet_m_drawn_abs, sweet_m_latch_abs;                           /* SweetFramebuffer.cpp */
+ extern uint32_t sweet_m_frames;
+ void semmc_top_print(void);
++extern uint64_t sweet_lse_count;                                                /* osfmk/arm64/sleh.c */
+ }
+ 
+ static uint64_t
+@@ -1390,7 +1391,7 @@ mem_bench(const char *tag)
+ static void
+ gpu_measure(__unused void *param, __unused wait_result_t wr_)
+ {
+-	uint64_t rb = 0, ra = 0, wb = 0, wa = 0, da = 0, la = 0;
++	uint64_t rb = 0, ra = 0, wb = 0, wa = 0, da = 0, la = 0, lse = 0;
+ 	uint32_t f = 0;
+ 
+ 	mem_bench("start");
+@@ -1410,6 +1411,9 @@ gpu_measure(__unused void *param, __unused wait_result_t wr_)
+ 		    samples ? busy * 100 / samples : 0, df, df ? abs_us(nda - da) / df : 0, df ? abs_us(nla - la) / df : 0,
+ 		    (nrb - rb) >> 10, rus / 1000, rus ? (nrb - rb) / rus : 0, (nwb - wb) >> 10, wus / 1000, wus ? (nwb - wb) / wus : 0);
+ 		rb = nrb; ra = nra; wb = nwb; wa = nwa; da = nda; la = nla; f = nf;
++		uint64_t nlse = sweet_lse_count;
++		IOLog("MEAS: emulated atomics %llu a second\n", (nlse - lse) / 5);
++		lse = nlse;
+ 		semmc_top_print();
+ 		if (window == 11) {
+ 			mem_bench("busy");
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index a2a8c1b..39df72c 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -888,6 +888,9 @@ extern int _sweet_lse_x(user_addr_t, uint32_t, uint64_t, uint64_t, uint64_t *);
+  * (machine_routines_asm.s); returns false for anything else (CASP stays
+  * EXC_BAD_INSTRUCTION).
+  */
++/* lavender: emulated atomics, read by the gpu_meas log (TopazAdreno.cpp) */
++uint64_t sweet_lse_count;
++
+ static bool
+ sweet_emulate_lse(arm_saved_state_t *state, uint32_t instr)
+ {
+@@ -943,6 +946,7 @@ sweet_emulate_lse(arm_saved_state_t *state, uint32_t instr)
+ 		set_saved_state_reg(state, dst, (register_t)old);
+ 	}
+ 	add_saved_state_pc(state, 4);
++	sweet_lse_count++;
+ 	return true;
+ }
+ #endif /* SWEET */
