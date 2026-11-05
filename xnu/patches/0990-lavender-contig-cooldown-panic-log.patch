@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index e17297a..98a576b 100644
+index e17297a..37aecb6 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
 @@ -29,6 +29,8 @@
@@ -11,7 +11,21 @@ index e17297a..98a576b 100644
  #include "SweetSurface.h"
  
  #if defined(SWEET)
-@@ -1092,10 +1094,21 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+@@ -668,6 +670,13 @@ IOCoreSurfaceRoot::start(IOService *provider)
+ 		return false;
+ 	}
+ 	sweet_surface_init_lock();
++	{
++		/* lavender: by the first surface RAM is too fragmented (0 of 10 buffers): set them aside now */
++		uint32_t gpu_on = 0;
++		if (PE_parse_boot_argn("gpu", &gpu_on, sizeof(gpu_on)) && gpu_on != 0) {
++			sweet_res_fill();
++		}
++	}
+ 	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
+ 	registerService();
+ 	IOLog("SWEET SURF: IOCoreSurfaceRoot registered\n");
+@@ -1092,10 +1101,21 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  					mem = sweet_res_take(take);
  				}
  			}
