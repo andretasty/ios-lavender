@@ -1,0 +1,152 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 5e37cbf..008cfd6 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/sweet_emmc.c			standard
+ bsd/dev/sweet_wdt.c			standard
+ bsd/dev/sweet_novatek.c		standard
+ bsd/dev/sweet_goldclk.c		standard
++bsd/dev/sweet_cputop.c		standard
+ bsd/dev/redwood_sta.c		standard
+ bsd/dev/redwood_net.c		standard
+ bsd/dev/redwood_apple80211.c	standard
+diff --git a/bsd/dev/sweet_cputop.c b/bsd/dev/sweet_cputop.c
+new file mode 100644
+index 0000000..d5fdaf4
+--- /dev/null
++++ b/bsd/dev/sweet_cputop.c
+@@ -0,0 +1,94 @@
++/*
++ * lavender: who uses the CPUs. Between two calls, per process: the task's total
++ * user + system time (Mach absolute units, fill_taskprocinfo), as a percentage
++ * of one core. Idle threads belong to kernel_task, so with 4 cores the sum is
++ * about 400 and kernel_task's share is mostly idle time. For the gpu_meas log.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/proc_internal.h>
++#include <sys/bsdtask_info.h>
++#include <sys/proc_info.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++
++void sweet_cputop_print(void);
++
++#define TOP_SLOTS 512
++static struct {
++	int pid;
++	uint64_t last;
++	uint64_t delta;
++	char name[17];
++} top[TOP_SLOTS];
++
++static int
++top_visit(proc_t p, __unused void *arg)
++{
++	struct proc_taskinfo_internal info;
++	task_t task = proc_task(p);
++	int pid = proc_pid(p), at = -1;
++
++	if (task == NULL) {
++		return PROC_RETURNED;
++	}
++	bzero(&info, sizeof(info));
++	fill_taskprocinfo(task, &info);
++	uint64_t now = info.pti_total_user + info.pti_total_system;
++	for (int i = 0; i < TOP_SLOTS; i++) {
++		if (top[i].pid == pid && top[i].name[0] != 0) {
++			at = i;
++			break;
++		}
++		if (at < 0 && top[i].name[0] == 0) {
++			at = i;
++		}
++	}
++	if (at < 0) {
++		return PROC_RETURNED;
++	}
++	if (top[at].name[0] == 0 || top[at].pid != pid) {
++		top[at].pid = pid;
++		top[at].last = 0;
++		proc_name(pid, top[at].name, sizeof(top[at].name));
++		if (top[at].name[0] == 0) {
++			strlcpy(top[at].name, "?", sizeof(top[at].name));
++		}
++	}
++	top[at].delta = now > top[at].last ? now - top[at].last : 0;
++	top[at].last = now;
++	return PROC_RETURNED;
++}
++
++void
++sweet_cputop_print(void)
++{
++	static uint64_t then;
++	uint64_t t = mach_absolute_time(), window = t - then, total = 0;
++	char line[220];
++
++	then = t;
++	proc_iterate(PROC_ALLPROCLIST, top_visit, NULL, NULL, NULL);
++	int n = snprintf(line, sizeof(line), "MEAS cpu:");
++	for (int shown = 0; shown < 8; shown++) {
++		int best = -1;
++		for (int i = 0; i < TOP_SLOTS; i++) {
++			if (top[i].name[0] != 0 && top[i].delta != 0 && (best < 0 || top[i].delta > top[best].delta)) {
++				best = i;
++			}
++		}
++		if (best < 0 || n > (int)sizeof(line) - 30) {
++			break;
++		}
++		n += snprintf(line + n, sizeof(line) - n, " %s %llu%%", top[best].name, top[best].delta * 100 / (window ? window : 1));
++		total += top[best].delta;
++		top[best].delta = 0;
++	}
++	for (int i = 0; i < TOP_SLOTS; i++) {
++		total += top[i].delta;
++		top[i].delta = 0;
++	}
++	printf("%s | sum %llu%%\n", line, total * 100 / (window ? window : 1));
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+index 14ac2f5..79f850c 100644
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -1211,6 +1211,7 @@ extern void thread_deallocate(thread_t);
+ extern int hz;
+ extern void sweet_novatek_init(void);
+ extern void sweet_goldclk_init(void);
++extern void sweet_sample_start(void);
+ 
+ static char semmc_log_ring[SEMMC_LOG_RING];
+ static int semmc_log_chan;
+@@ -1386,6 +1387,7 @@ out:
+ 		semmc_log_start();
+ 		sweet_novatek_init();
+ 		sweet_goldclk_init();
++		sweet_sample_start();                   /* the stack samples of SpringBoard and backboardd */
+ 	}
+ 	return err;
+ }
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index c69fed1..7f34bee 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -1328,6 +1328,7 @@ extern uint64_t sweet_m_drawn_abs, sweet_m_latch_abs;
+ extern uint32_t sweet_m_frames;
+ void semmc_top_print(void);
+ extern uint64_t sweet_lse_count;                                                /* osfmk/arm64/sleh.c */
++void sweet_cputop_print(void);                                                  /* bsd/dev/sweet_cputop.c */
+ }
+ 
+ static uint64_t
+@@ -1415,6 +1416,7 @@ gpu_measure(__unused void *param, __unused wait_result_t wr_)
+ 		IOLog("MEAS: emulated atomics %llu a second\n", (nlse - lse) / 5);
+ 		lse = nlse;
+ 		semmc_top_print();
++		sweet_cputop_print();
+ 		if (window == 11) {
+ 			mem_bench("busy");
+ 		}
