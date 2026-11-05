@@ -1,0 +1,37 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 4710f0b..a0818f8 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5869,6 +5869,32 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_envc++;
+ 	}
+ 
++	/*
++	 * lavender: boot-arg sweetnoexec=NAME,NAME: these programs do not start. Ones that crash and come
++	 * back reload everything from the disk: half of all reads on this phone, which starved the rest.
++	 */
++	if (imgp->ip_ndp != NULL) {
++		static char noexec[256];
++		static int noexec_loaded;
++		if (!noexec_loaded) {
++			(void)PE_parse_boot_argn("sweetnoexec", noexec, sizeof(noexec));
++			noexec_loaded = 1;
++		}
++		const char *nm = imgp->ip_ndp->ni_cnd.cn_nameptr, *w = noexec;
++		size_t nl = imgp->ip_ndp->ni_cnd.cn_namelen;
++		while (*w != 0) {
++			const char *e = w;
++			while (*e != 0 && *e != ',') {
++				e++;
++			}
++			if ((size_t)(e - w) == nl && nl != 0 && strncmp(w, nm, nl) == 0) {
++				error = EPERM;
++				goto bad;
++			}
++			w = *e != 0 ? e + 1 : e;
++		}
++	}
++
+ 	/* topaz: one more variable for the programs that get our library (see exec_inject_env) */
+ 	if (exec_inject_env(imgp, inject_env, sizeof(inject_env))) {
+ 		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(inject_env), UIO_SYSSPACE, TRUE);
