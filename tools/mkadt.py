@@ -210,7 +210,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
             ('canvas-width', u32(1080 if native else 1125)),
             ('canvas-height', u32(2400 if native else 2436)),
             # lavender: no MDP/DSI register access yet (patch 0961); topaz keeps its default
-        ] + ([('mdss-base', u64(0))] if LAVENDER else []) + [
+        ] + ([('mdss-base', u64(int(os.environ.get('LAV_MDSS', '0'), 16)))] if LAVENDER else []) + [
         ])])
 
     fbcon = node('sweet-fbcon', [
