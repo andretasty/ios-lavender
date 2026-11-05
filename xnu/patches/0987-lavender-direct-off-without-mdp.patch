@@ -1,0 +1,53 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index bffaea5..7b9a9f5 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -862,7 +862,8 @@ AppleCLCD::directEligible(const uint8_t *rec, SweetSurface **held)
+ 			layer = layer < 0 ? (int)i : -2;
+ 		}
+ 	}
+-	return layer >= 0 && held[layer] != NULL && held[layer]->gpuPool && !fPowerOff && !fConsShown;
++	/* lavender: no MDP registers (mdss-base 0), showDirect would write through NULL: the copy path */
++	return fVig0 != NULL && layer >= 0 && held[layer] != NULL && held[layer]->gpuPool && !fPowerOff && !fConsShown;
+ }
+ 
+ void
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 332b03d..13d537c 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -697,7 +697,19 @@ smmu_setup(void)
+ 		 * stands for bypass. gpu_cb: the bank; gpu_idx: the mapping group; gpu_vmid: CBAR VMID;
+ 		 * gpu_smrfirst: SMR before S2CR (Linux: S2CR first); gpu_m1: M=1 with empty tables.
+ 		 */
+-		uint32_t cb = 0, idx = 0, vmid = 1, smrfirst = 0, m1 = 0;
++		uint32_t cb = 0, idx = 0, vmid = 1, smrfirst = 0, m1 = 0, smrmask = 0, impl = 0;
++		(void)PE_parse_boot_argn("gpu_smrmask", &smrmask, sizeof(smrmask));
++		(void)PE_parse_boot_argn("gpu_impl", &impl, sizeof(impl));
++		if (impl) {
++			/* stock DT arm,smmu-kgsl attach-impl-defs: the implementation registers the stock driver sets */
++			static const uint32_t defs[][2] = {
++				{ 0x6000, 0x2378 }, { 0x6060, 0x1055 }, { 0x678c, 0x08 }, { 0x6794, 0x28 }, { 0x6800, 0x06 }, { 0x6900, 0x3ff },
++				{ 0x6924, 0x204 }, { 0x6928, 0x11000 }, { 0x6930, 0x800 }, { 0x6960, 0xffffffff }, { 0x6b64, 0x1a5551 }, { 0x6b68, 0x9a82a382 },
++			};
++			for (unsigned i = 0; i < sizeof(defs) / sizeof(defs[0]); i++) {
++				smmu_step(defs[i][0], defs[i][1]);
++			}
++		}
+ 		(void)PE_parse_boot_argn("gpu_cb", &cb, sizeof(cb));
+ 		(void)PE_parse_boot_argn("gpu_idx", &idx, sizeof(idx));
+ 		(void)PE_parse_boot_argn("gpu_vmid", &vmid, sizeof(vmid));
+@@ -719,11 +731,11 @@ smmu_setup(void)
+ 		smmu_step(cbo + 0x03C, 0);
+ 		smmu_step(cbo + 0x000, m1 ? 0x67 : 0x60);
+ 		if (smrfirst) {
+-			smmu_step(0x800 + 4 * idx, (1u << 31) | (1u << 16));
++			smmu_step(0x800 + 4 * idx, (1u << 31) | (smrmask << 16));
+ 		}
+ 		smmu_step(0xC00 + 4 * idx, cb);                                 /* S2CR: translate through the bank */
+ 		if (!smrfirst) {
+-			smmu_step(0x800 + 4 * idx, (1u << 31) | (1u << 16));
++			smmu_step(0x800 + 4 * idx, (1u << 31) | (smrmask << 16));
+ 		}
+ 		smmu_on = true;
+ 		tlb_flush();
