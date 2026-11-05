@@ -32,14 +32,16 @@ index 7171b47..6090811 100644
  }
 diff --git a/bsd/dev/sweet_goldclk.c b/bsd/dev/sweet_goldclk.c
 new file mode 100644
-index 0000000..e1683d2
+index 0000000..dba5b89
 --- /dev/null
 +++ b/bsd/dev/sweet_goldclk.c
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,125 @@
 +/*
 + * lavender: measure the real Gold clock. Reads the cluster RCG and PLL, then
-+ * counts CPU cycles (PMCCNTR) against the 19.2 MHz system counter. Only reads
-+ * clock registers; changes nothing in them.
++ * counts CPU cycles (PMCCNTR) against the 19.2 MHz system counter.
++ * Boot-arg goldl=<L> moves the cluster to its PLL at L x 19.2 MHz. No voltage
++ * change: the rail stays as the bootloader left it, so only use L values whose
++ * stock corner ceiling the rail meets (stock: 0x3a = 1113.6 MHz, 724 mV).
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -49,6 +51,7 @@ index 0000000..e1683d2
 +#include <kern/sched_prim.h>
 +#include <mach/mach_time.h>
 +#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern kern_return_t thread_terminate(thread_t);
@@ -58,6 +61,45 @@ index 0000000..e1683d2
 +#define PERF_PLL_PA     0x17814000u     /* PLL at +0x2000: MODE +0, L +4, STATUS +0x2c */
 +
 +static int goldclk_chan;
++
++static void
++goldclk_rcg(vm_offset_t rcg, uint32_t cfg)
++{
++	*(volatile uint32_t *)(rcg + 0x1054) = cfg;
++	*(volatile uint32_t *)(rcg + 0x1050) |= 1u;
++	__asm__ volatile ("dsb sy");
++	for (int i = 0; i < 1000 && (*(volatile uint32_t *)(rcg + 0x1050) & 1u); i++) {
++		delay(10);
++	}
++}
++
++/* clk_osm_setup_cluster_pll order: off, L, bypass, reset released, output on, lock, then the mux. */
++static void
++goldclk_set(vm_offset_t rcg, vm_offset_t pll, uint32_t l)
++{
++	volatile uint32_t *mode = (volatile uint32_t *)(pll + 0x2000);
++	int lock = 0;
++
++	goldclk_rcg(rcg, 0x401);        /* GPLL0, where the bootloader leaves it */
++	*mode = 0;
++	*(volatile uint32_t *)(pll + 0x2004) = l;
++	*mode = 2;
++	__asm__ volatile ("dsb sy");
++	delay(1000);
++	*mode = 6;
++	__asm__ volatile ("dsb sy");
++	delay(1000);
++	*mode = 7;
++	__asm__ volatile ("dsb sy");
++	for (int i = 0; i < 1000 && !lock; i++) {
++		lock = (*(volatile uint32_t *)(pll + 0x202c) >> 16) & 1;
++		delay(10);
++	}
++	if (lock) {
++		goldclk_rcg(rcg, 0x300);
++	}
++	printf("GOLD: L=%#x lock=%d cfg=%#x\n", l, lock, *(volatile uint32_t *)(rcg + 0x1054));
++}
 +
 +static uint64_t
 +goldclk_measure(void)
@@ -86,6 +128,7 @@ index 0000000..e1683d2
 +{
 +	vm_offset_t rcg = ml_io_map(PERF_RCG_PA, 0x4000);
 +	vm_offset_t pll = ml_io_map(PERF_PLL_PA, 0x4000);
++	uint32_t goldl = 0;
 +
 +	for (int i = 0; i < 3; i++) {
 +		uint64_t deadline;
@@ -98,6 +141,10 @@ index 0000000..e1683d2
 +			    *(volatile uint32_t *)(rcg + 0x1050), *(volatile uint32_t *)(rcg + 0x1054),
 +			    *(volatile uint32_t *)(pll + 0x2000), *(volatile uint32_t *)(pll + 0x2004),
 +			    *(volatile uint32_t *)(pll + 0x202c));
++			if (PE_parse_boot_argn("goldl", &goldl, sizeof(goldl)) && goldl != 0) {
++				goldclk_set(rcg, pll, goldl);
++				printf("GOLD: now %llu MHz\n", goldclk_measure());
++			}
 +		}
 +	}
 +	(void)thread_terminate(current_thread());
