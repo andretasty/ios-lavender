@@ -1,0 +1,17 @@
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 76bd573..e7dc2c0 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -678,9 +678,9 @@ static bool
+ smmu_setup(void)
+ {
+ 	IOLog("TopazGPU: smmu mode %u: idr0 %08x idr1 %08x sCR0 %08x gfsr %08x\n", gpu_smmu, rd(smmu, 0x20), rd(smmu, 0x24), rd(smmu, 0x0), rd(smmu, 0x48));
+-	for (uint32_t n = 0; n < 4; n++) {
+-		IOLog("TopazGPU: smmu group %u: SMR %08x S2CR %08x CB sctlr %08x CBAR %08x\n", n, rd(smmu, 0x800 + 4 * n),
+-		    rd(smmu, 0xC00 + 4 * n), rd(smmu, SMMU_CB0 + 0x1000 * n), rd(smmu, 0x1000 + 4 * n));
++	/* (reading context bank 2 stalled the CPU for good: not ours; stock DT, only bank 0 is the user one) */
++	for (uint32_t n = 0; n < 3; n++) {
++		IOLog("TopazGPU: smmu group %u: SMR %08x S2CR %08x\n", n, rd(smmu, 0x800 + 4 * n), rd(smmu, 0xC00 + 4 * n));
+ 	}
+ 	switch (gpu_smmu) {
+ 	case 0:
