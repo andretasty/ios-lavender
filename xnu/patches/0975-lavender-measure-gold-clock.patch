@@ -1,0 +1,116 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 8276d11..399a0a0 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_emmc.c			standard
+ bsd/dev/sweet_wdt.c			standard
+ bsd/dev/sweet_novatek.c		standard
++bsd/dev/sweet_goldclk.c		standard
+ bsd/dev/redwood_sta.c		standard
+ bsd/dev/redwood_net.c		standard
+ bsd/dev/redwood_apple80211.c	standard
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+index 7171b47..6090811 100644
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -1194,6 +1194,7 @@ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern int hz;
+ extern void sweet_novatek_init(void);
++extern void sweet_goldclk_init(void);
+ 
+ static char semmc_log_ring[SEMMC_LOG_RING];
+ static int semmc_log_chan;
+@@ -1331,6 +1332,7 @@ out:
+ 	} else {
+ 		semmc_log_start();
+ 		sweet_novatek_init();
++		sweet_goldclk_init();
+ 	}
+ 	return err;
+ }
+diff --git a/bsd/dev/sweet_goldclk.c b/bsd/dev/sweet_goldclk.c
+new file mode 100644
+index 0000000..c33e117
+--- /dev/null
++++ b/bsd/dev/sweet_goldclk.c
+@@ -0,0 +1,78 @@
++/*
++ * lavender: measure the real Gold clock. Reads the cluster RCG and PLL, then
++ * counts CPU cycles (PMCCNTR) against the 19.2 MHz system counter. Only reads
++ * clock registers; changes nothing in them.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++void sweet_goldclk_init(void);
++
++#define PERF_RCG_PA     0x17810000u     /* CMD +0x1050, CFG +0x1054 */
++#define PERF_PLL_PA     0x17814000u     /* PLL at +0x2000: MODE +0, L +4, STATUS +0x2c */
++
++static int goldclk_chan;
++
++static uint64_t
++goldclk_measure(void)
++{
++	uint64_t pmcr, c0, c1, t0, t1, ns, lim;
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++
++	__asm__ volatile ("mrs %0, pmcr_el0" : "=r"(pmcr));
++	__asm__ volatile ("msr pmcr_el0, %0" :: "r"(pmcr | 1u));
++	__asm__ volatile ("msr pmcntenset_el0, %0" :: "r"(1ULL << 31));
++	__asm__ volatile ("isb");
++	nanoseconds_to_absolutetime(50ULL * NSEC_PER_MSEC, &lim);
++	t0 = mach_absolute_time();
++	__asm__ volatile ("mrs %0, pmccntr_el0" : "=r"(c0));
++	do {
++		t1 = mach_absolute_time();
++	} while (t1 - t0 < lim);
++	__asm__ volatile ("mrs %0, pmccntr_el0" : "=r"(c1));
++	(void)ml_set_interrupts_enabled(istate);
++	absolutetime_to_nanoseconds(t1 - t0, &ns);
++	return ns == 0 ? 0 : ((c1 - c0) * 1000ULL) / ns;
++}
++
++static void
++goldclk_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	vm_offset_t rcg = ml_io_map(PERF_RCG_PA, 0x4000);
++	vm_offset_t pll = ml_io_map(PERF_PLL_PA, 0x4000);
++
++	for (int i = 0; i < 3; i++) {
++		uint64_t deadline;
++		clock_interval_to_deadline(20, NSEC_PER_SEC, &deadline);
++		(void)assert_wait_deadline(&goldclk_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++		printf("GOLD: cpu %d %llu MHz\n", cpu_number(), goldclk_measure());
++		if (i == 0 && rcg && pll) {
++			printf("GOLD: rcg cmd=%#x cfg=%#x pll mode=%#x l=%#x status=%#x\n",
++			    *(volatile uint32_t *)(rcg + 0x1050), *(volatile uint32_t *)(rcg + 0x1054),
++			    *(volatile uint32_t *)(pll + 0x2000), *(volatile uint32_t *)(pll + 0x2004),
++			    *(volatile uint32_t *)(pll + 0x202c));
++		}
++	}
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_goldclk_init(void)
++{
++	thread_t thread;
++
++	if (kernel_thread_start(goldclk_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
