@@ -32,7 +32,7 @@ index 7171b47..6090811 100644
  }
 diff --git a/bsd/dev/sweet_goldclk.c b/bsd/dev/sweet_goldclk.c
 new file mode 100644
-index 0000000..c33e117
+index 0000000..e1683d2
 --- /dev/null
 +++ b/bsd/dev/sweet_goldclk.c
 @@ -0,0 +1,78 @@
@@ -92,7 +92,7 @@ index 0000000..c33e117
 +		clock_interval_to_deadline(20, NSEC_PER_SEC, &deadline);
 +		(void)assert_wait_deadline(&goldclk_chan, THREAD_UNINT, deadline);
 +		thread_block(THREAD_CONTINUE_NULL);
-+		printf("GOLD: cpu %d %llu MHz\n", cpu_number(), goldclk_measure());
++		printf("GOLD: %llu MHz\n", goldclk_measure());
 +		if (i == 0 && rcg && pll) {
 +			printf("GOLD: rcg cmd=%#x cfg=%#x pll mode=%#x l=%#x status=%#x\n",
 +			    *(volatile uint32_t *)(rcg + 0x1050), *(volatile uint32_t *)(rcg + 0x1054),
