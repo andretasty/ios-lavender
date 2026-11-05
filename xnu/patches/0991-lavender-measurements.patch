@@ -1,0 +1,199 @@
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+index 6090811..e065090 100644
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -1407,6 +1407,9 @@ semmc_bpsize(dev_t dev)
+ 	return (int)SEMMC_SECTOR;
+ }
+ 
++/* lavender: read by the gpu_meas log (TopazAdreno.cpp) */
++uint64_t semmc_rd_bytes, semmc_rd_abs, semmc_wr_bytes, semmc_wr_abs;
++
+ static void
+ semmc_bstrategy(struct buf *bp)
+ {
+@@ -1439,9 +1442,17 @@ semmc_bstrategy(struct buf *bp)
+ 			err = buf_map(bp, &addr);
+ 			if (err == 0) {
+ 				lck_mtx_lock(&semmc_lock);
++				uint64_t io0 = mach_absolute_time();
+ 				err = is_read ?
+ 				    semmc_read_blocks(semmc.part.first + blkno, (uint32_t)nblk, addr) :
+ 				    semmc_write_blocks(semmc.part.first + blkno, (uint32_t)nblk, addr);
++				if (is_read) {
++					semmc_rd_abs += mach_absolute_time() - io0;
++					semmc_rd_bytes += count;
++				} else {
++					semmc_wr_abs += mach_absolute_time() - io0;
++					semmc_wr_bytes += count;
++				}
+ 				lck_mtx_unlock(&semmc_lock);
+ 				buf_unmap(bp);
+ 			}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 3f367e2..bf1ab99 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -918,6 +918,12 @@ AppleCLCD::presenter(void)
+ 	}
+ }
+ 
++/* lavender: per-frame times for the gpu_meas log (TopazAdreno.cpp) */
++extern "C" {
++uint64_t sweet_m_drawn_abs, sweet_m_latch_abs;
++uint32_t sweet_m_frames;
++}
++
+ void
+ AppleCLCD::showDirect(const uint8_t *rec, SweetSurface **heldIn)
+ {
+@@ -933,9 +939,12 @@ AppleCLCD::showDirect(const uint8_t *rec, SweetSurface **heldIn)
+ 		sweet_hold_set(dropped, false);
+ 		uint64_t waited = mach_absolute_time(), wns = 0;  /* (present waits for the GPU too) */
+ 		present(rec);
++		uint64_t latch0 = mach_absolute_time();
+ 		for (int t = 0; t < 250 && (fCtl0[0x18 / 4] & 0x20001) != 0; t++) {
+ 			IODelay(100);                           /* until the MDP has latched it */
+ 		}
++		sweet_m_latch_abs += mach_absolute_time() - latch0;
++		sweet_m_frames++;
+ 		absolutetime_to_nanoseconds(mach_absolute_time() - waited, &wns);
+ 		sweet_fps_wait_ns += wns;
+ 		IOLockLock(fLock);
+@@ -1288,7 +1297,9 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 		return false;
+ 	}
+ 	bool ok = false;
++	uint64_t drawn0 = mach_absolute_time();
+ 	(void)topaz_surface_drawn(s, 100);
++	sweet_m_drawn_abs += mach_absolute_time() - drawn0;
+ 	if (s->scanoutPhys != 0 && s->bytesPerElement == 4 &&
+ 	    s->width >= fWidth && s->height >= fHeight) {
+ 		/* full-screen surface: panel window at the logical offset */
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 7a7dc1c..9f88a39 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -31,6 +31,7 @@
+ #include <pexpert/device_tree.h>
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
++#include <kern/clock.h>
+ 
+ extern "C" {
+ vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+@@ -1319,6 +1320,101 @@ redwood_tl(const char *format, ...)
+ 	(void)format;
+ }
+ 
++/* ---------------------------------------------------------------- measurements (boot-arg gpu_meas=1) */
++
++extern "C" {
++extern uint64_t semmc_rd_bytes, semmc_rd_abs, semmc_wr_bytes, semmc_wr_abs;     /* bsd/dev/sweet_emmc.c */
++extern uint64_t sweet_m_drawn_abs, sweet_m_latch_abs;                           /* SweetFramebuffer.cpp */
++extern uint32_t sweet_m_frames;
++}
++
++static uint64_t
++abs_us(uint64_t delta)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(delta, &ns);
++	return ns / 1000;
++}
++
++/* MB/s of the best of 3 runs of one operation over a buffer */
++enum { M_READ, M_WRITE, M_COPY };
++static uint64_t
++mem_rate(uint8_t *p, uint64_t size, int op)
++{
++	uint64_t best = ~0ull;
++
++	for (int run = 0; run < 3; run++) {
++		uint64_t t0 = mach_absolute_time();
++		if (op == M_READ) {
++			uint64_t sum = 0;
++			for (uint64_t i = 0; i < size; i += 8) {
++				sum += *(volatile uint64_t *)(p + i);
++			}
++			(void)sum;
++		} else if (op == M_WRITE) {
++			memset(p, run, size);
++		} else {
++			memcpy(p, p + size / 2, size / 2);
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		uint64_t us = abs_us(mach_absolute_time() - t0);
++		best = us < best ? us : best;
++		IOSleep(5);
++	}
++	return best == 0 ? 0 : (op == M_COPY ? size / 2 : size) / best;
++}
++
++static void
++mem_bench(const char *tag)
++{
++	const uint64_t size = 32u << 20;
++	IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, size, PAGE_SIZE);
++
++	if (md != NULL) {
++		uint8_t *p = (uint8_t *)md->getBytesNoCopy();
++		bzero(p, size);
++		IOLog("MEAS %s: RAM cached 32 MB: read %llu MB/s, write %llu MB/s, copy %llu MB/s\n", tag,
++		    mem_rate(p, size, M_READ), mem_rate(p, size, M_WRITE), mem_rate(p, size, M_COPY));
++		md->release();
++	}
++	void *va = NULL;
++	uint64_t pa = topaz_gpu_pool_alloc(8u << 20, &va);
++	if (pa != 0) {
++		IOLog("MEAS %s: GPU pool (write-combined) 8 MB: read %llu MB/s, write %llu MB/s\n", tag,
++		    mem_rate((uint8_t *)va, 8u << 20, M_READ), mem_rate((uint8_t *)va, 8u << 20, M_WRITE));
++		topaz_gpu_pool_free(pa, 8u << 20);
++	}
++}
++
++static void
++gpu_measure(__unused void *param, __unused wait_result_t wr_)
++{
++	uint64_t rb = 0, ra = 0, wb = 0, wa = 0, da = 0, la = 0;
++	uint32_t f = 0;
++
++	mem_bench("start");
++	for (uint32_t window = 0;; window++) {
++		uint32_t busy = 0, samples = 0;
++		uint64_t t0 = mach_absolute_time();
++
++		while (abs_us(mach_absolute_time() - t0) < 5000000) {
++			samples++;
++			busy += (gpu_rd(0x4f5) >> 31) & 1;              /* RBBM_STATUS.GPU_BUSY_IGN_AHB */
++			IOSleep(1);
++		}
++		uint64_t nrb = semmc_rd_bytes, nra = semmc_rd_abs, nwb = semmc_wr_bytes, nwa = semmc_wr_abs, nda = sweet_m_drawn_abs, nla = sweet_m_latch_abs;
++		uint32_t nf = sweet_m_frames, df = nf - f;
++		uint64_t rus = abs_us(nra - ra), wus = abs_us(nwa - wa);
++		IOLog("MEAS: GPU busy %u%% | frames %u: wait GPU %llu us, latch %llu us | disk read %llu KB in %llu ms (%llu MB/s), write %llu KB in %llu ms (%llu MB/s)\n",
++		    samples ? busy * 100 / samples : 0, df, df ? abs_us(nda - da) / df : 0, df ? abs_us(nla - la) / df : 0,
++		    (nrb - rb) >> 10, rus / 1000, rus ? (nrb - rb) / rus : 0, (nwb - wb) >> 10, wus / 1000, wus ? (nwb - wb) / wus : 0);
++		rb = nrb; ra = nra; wb = nwb; wa = nwa; da = nda; la = nla; f = nf;
++		if (window == 11) {
++			mem_bench("busy");
++		}
++	}
++}
++
+ /* ---------------------------------------------------------------- start */
+ 
+ static void
+@@ -1343,6 +1439,12 @@ topaz_adreno_thread(__unused void *param, __unused wait_result_t wr_)
+ 	ready = true;
+ 	RedwoodGPUStart();
+ 	IOLog("TopazGPU: Adreno 512 ready, RedwoodGPU published\n");
++	uint32_t meas = 0;
++	thread_t measure;
++	if (PE_parse_boot_argn("gpu_meas", &meas, sizeof(meas)) && meas != 0 &&
++	    kernel_thread_start(gpu_measure, NULL, &measure) == KERN_SUCCESS) {
++		thread_deallocate(measure);
++	}
+ }
+ 
+ void
