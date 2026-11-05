@@ -32,10 +32,10 @@ index 61638ae..a2d4cd3 100644
  }
 diff --git a/bsd/dev/sweet_novatek.c b/bsd/dev/sweet_novatek.c
 new file mode 100644
-index 0000000..ef24a3d
+index 0000000..ba303e9
 --- /dev/null
 +++ b/bsd/dev/sweet_novatek.c
-@@ -0,0 +1,353 @@
+@@ -0,0 +1,366 @@
 +/*
 + * lavender: Novatek NT36672A touch (the panel's own IC) on BLSP1 QUP1 I2C.
 + * Facts from the OrangeFox kernel on this phone: c175000.i2c, NVT-ts, IRQ
@@ -70,6 +70,7 @@ index 0000000..ef24a3d
 +#define PIN_SCL_CTL             0x3000u
 +#define PIN_RESET_CTL           0x2000u         /* GPIO 66 */
 +#define PIN_RESET_IO            0x2004u
++#define PIN_IRQ_IO              0x3004u         /* GPIO 67 */
 +#define PIN_I2C_MUX             (3u << 2)
 +#define QUP_PA                  0x0c174000u
 +#define QUP_OFF                 0x1000u
@@ -309,7 +310,8 @@ index 0000000..ef24a3d
 +static void
 +nv_thread(__unused void *arg, __unused wait_result_t result)
 +{
-+	unsigned delay_s = 60, errors = 0;
++	unsigned delay_s = 60, errors = 0, rawlog = 0, ticks = 0;
++	uint8_t last[12] = { 0 };
 +	uint8_t params[NVT_PARAMS_LEN], data[NVT_POINT_LEN * NVT_FINGERS];
 +	int err;
 +
@@ -369,6 +371,17 @@ index 0000000..ef24a3d
 +			continue;
 +		}
 +		errors = 0;
++		/* bring-up: show the raw head of every changed frame, and the IRQ pin once a minute */
++		if (memcmp(data, last, sizeof(last)) != 0 && rawlog < 120) {
++			rawlog++;
++			memcpy(last, data, sizeof(last));
++			printf("NVT raw %02x %02x %02x %02x %02x %02x | %02x %02x %02x %02x %02x %02x\n",
++			    data[0], data[1], data[2], data[3], data[4], data[5],
++			    data[6], data[7], data[8], data[9], data[10], data[11]);
++		}
++		if (++ticks % 3750u == 0) {
++			printf("NVT: alive, irq pin %u, raw %02x %02x\n", rd(nv.north, PIN_IRQ_IO) & 1u, data[0], data[1]);
++		}
 +		nv_frame(data);
 +		nv_sleep(16);
 +	}
