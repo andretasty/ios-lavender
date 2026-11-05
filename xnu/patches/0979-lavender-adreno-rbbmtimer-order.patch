@@ -1,0 +1,22 @@
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index a5b6255..98c4fd5 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -405,8 +405,6 @@ power_up(void)
+ 		IOLog("TopazGPU: CX GDSC: no PWR_ON (%08x)\n", rd(gpucc, 0x1008));
+ 		return false;
+ 	}
+-	rcg_set(0x10b0, 0, 1);                                          /* rbbmtimer: XO */
+-	branch_on(gpucc, 0x10d0, "gpucc_rbbmtimer");
+ 	rcg_set(0x1030, 0, 1);                                          /* rbcpr: XO */
+ 	branch_on(gpucc, 0x1054, "gpucc_rbcpr");
+ 	/* GX: bcr reset, AON reset, clamp off, unclamp logic (gdsc.c: SW_RESET | CLAMP_IO | AON_RESET) */
+@@ -432,6 +430,8 @@ power_up(void)
+ 	if (!branch_on(gpucc, 0x1098, "gpucc_gfx3d")) {
+ 		return false;
+ 	}
++	rcg_set(0x10b0, 0, 1);                                          /* rbbmtimer: XO, inside GX */
++	branch_on(gpucc, 0x10d0, "gpucc_rbbmtimer");
+ 	IODelay(20);
+ 	return true;
+ }
