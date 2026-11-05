@@ -181,6 +181,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         ('compatible', cstr('sweet-io') + cstr('arm-io')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
+    ] + ([('topaz-blobs', open(os.environ['LAV_BLOBS'], 'rb').read())] if LAVENDER and os.environ.get('LAV_BLOBS') else []) + [
         ('ranges', u64(0, SOC_BASE, 0x100000000 - SOC_BASE)),
     ], [gic,
         # No hardware: watchdogd checks IODeviceTree:/arm-io/wdt for no-pmu and

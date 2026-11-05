@@ -24,7 +24,7 @@
 
 extern const void *_dyld_get_shared_cache_range(size_t *length);
 
-#define TOPAZ_GL "/topaz/lib/libtopaz-gl.dylib"
+#define TOPAZ_GL "/private/var/tmp/libtopaz-gl.dylib"   /* lavender: written there by sweet_blobs.c */
 
 /*
  * CoreAnimation's OpenGL ES renderer hands a "function"'s numbers (a colour matrix, ...) to
