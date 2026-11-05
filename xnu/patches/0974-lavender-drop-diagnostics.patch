@@ -1,0 +1,193 @@
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+index a2d4cd3..7171b47 100644
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -1440,38 +1440,6 @@ semmc_bstrategy(struct buf *bp)
+ 				err = is_read ?
+ 				    semmc_read_blocks(semmc.part.first + blkno, (uint32_t)nblk, addr) :
+ 				    semmc_write_blocks(semmc.part.first + blkno, (uint32_t)nblk, addr);
+-				/* lavender: dyld sees zero Mach-O headers; re-read every all-zero 4 KiB page alone and log a mismatch */
+-				static uint8_t zpage[4096] __attribute__((aligned(64)));
+-				static int zlogged, zbad;
+-				if (is_read && err == 0) {
+-					for (uint64_t o = 0; o + sizeof(zpage) <= count; o += sizeof(zpage)) {
+-						const uint64_t *w = (const uint64_t *)(addr + o);
+-						uint64_t acc = 0;
+-						for (size_t k = 0; k < sizeof(zpage) / 8; k++) {
+-							acc |= w[k];
+-						}
+-						if (acc != 0) {
+-							continue;
+-						}
+-						int e2 = semmc_read_blocks(semmc.part.first + blkno + o / SEMMC_SECTOR,
+-						    sizeof(zpage) / SEMMC_SECTOR, zpage);
+-						uint64_t acc2 = 0;
+-						for (size_t k = 0; k < sizeof(zpage) / 8; k++) {
+-							acc2 |= ((const uint64_t *)zpage)[k];
+-						}
+-						if (acc2 != 0 || e2 != 0) {
+-							if (zbad++ < 200) {
+-								printf("ZBAD %llu +%llu of %llu e%d %llx\n", (unsigned long long)blkno,
+-								    (unsigned long long)o, (unsigned long long)count, e2,
+-								    (unsigned long long)((const uint64_t *)zpage)[0]);
+-							}
+-							memcpy(addr + o, zpage, sizeof(zpage));
+-						} else if (zlogged < 300 && o == 0) {
+-							zlogged++;
+-							printf("Z %llu %llu\n", (unsigned long long)blkno, (unsigned long long)count);
+-						}
+-					}
+-				}
+ 				lck_mtx_unlock(&semmc_lock);
+ 				buf_unmap(bp);
+ 			}
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 3ebda71..4710f0b 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5869,27 +5869,6 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_envc++;
+ 	}
+ 
+-	/* lavender: dyld names the file it rejects as all-zero only when asked to print its searches */
+-	if (imgp->ip_ndp != NULL) {
+-		const char *nm = imgp->ip_ndp->ni_cnd.cn_nameptr;
+-		size_t nl = imgp->ip_ndp->ni_cnd.cn_namelen;
+-		if ((nl == 11 && strncmp(nm, "SpringBoard", 11) == 0) || (nl == 7 && strncmp(nm, "chronod", 7) == 0)) {
+-			static const char *const dbg[] = { "DYLD_PRINT_SEARCHING=1", "DYLD_PRINT_LIBRARIES=1" };
+-			for (size_t i = 0; i < sizeof(dbg) / sizeof(dbg[0]); i++) {
+-				error = exec_add_user_string(imgp, CAST_USER_ADDR_T(dbg[i]), UIO_SYSSPACE, TRUE);
+-				if (error) {
+-					goto bad;
+-				}
+-				if (imgp->ip_argspace < new_ptr_size) {
+-					error = E2BIG;
+-					goto bad;
+-				}
+-				imgp->ip_argspace -= new_ptr_size;
+-				imgp->ip_envc++;
+-			}
+-		}
+-	}
+-
+ 	/* topaz: one more variable for the programs that get our library (see exec_inject_env) */
+ 	if (exec_inject_env(imgp, inject_env, sizeof(inject_env))) {
+ 		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(inject_env), UIO_SYSSPACE, TRUE);
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index 56ece6a..fde499c 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1895,21 +1895,6 @@ proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
+ 				printf("CRASH %s reason ns %u code 0x%llx: %s\n", p->p_comm,
+ 				    p->p_exit_reason->osr_namespace, p->p_exit_reason->osr_code,
+ 				    desc != NULL ? desc : "(none)");
+-				/* lavender: dyld's payload names the file it rejected */
+-				const char *kb = p->p_exit_reason->osr_kcd_buf;
+-				uint32_t kn = p->p_exit_reason->osr_bufsize;
+-				for (uint32_t i = 0; kb != NULL && i + 1 < kn; i++) {
+-					if (kb[i] == '/' && (i == 0 || kb[i - 1] == '\0')) {
+-						uint32_t j = i;
+-						while (j < kn && kb[j] >= 0x20 && kb[j] < 0x7f) {
+-							j++;
+-						}
+-						if (j < kn && kb[j] == '\0' && j - i > 1) {
+-							printf("CRASH %s path %s\n", p->p_comm, kb + i);
+-						}
+-						i = j;
+-					}
+-				}
+ 			}
+ 		}
+ #endif
+diff --git a/bsd/kern/kern_mman.c b/bsd/kern/kern_mman.c
+index c2bf54a..56f3d58 100644
+--- a/bsd/kern/kern_mman.c
++++ b/bsd/kern/kern_mman.c
+@@ -896,26 +896,6 @@ map_file_retry:
+ 		}
+ 	}
+ 
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
+-	/* lavender: dyld rejects some file of SpringBoard/chronod as all-zero; name it and show its first bytes */
+-	if (!mapanon && result == KERN_SUCCESS && (prot & VM_PROT_READ) &&
+-	    (strcmp(p->p_comm, "SpringBoard") == 0 || strcmp(p->p_comm, "chronod") == 0)) {
+-		static int mmlogged;
+-		if (mmlogged++ < 400) {
+-			char path[MAXPATHLEN];
+-			int plen = sizeof(path);
+-			uint64_t w[2] = { 0, 0 };
+-			if (vn_getpath(vp, path, &plen) != 0) {
+-				strlcpy(path, "?", sizeof(path));
+-			}
+-			int e = copyin((user_addr_t)(user_addr + pageoff), w, sizeof(w));
+-			printf("MMAP %s %s off 0x%llx len 0x%llx size %lld -> %s%llx %llx\n", p->p_comm, path,
+-			    (unsigned long long)file_pos, (unsigned long long)user_size,
+-			    (long long)ubc_getsize(vp), e ? "E" : "", (unsigned long long)w[0],
+-			    (unsigned long long)w[1]);
+-		}
+-	}
+-#endif
+ 	if (!mapanon) {
+ 		(void)vnode_put(vp);
+ 	}
+diff --git a/bsd/kern/sys_generic.c b/bsd/kern/sys_generic.c
+index fc92f71..66a3528 100644
+--- a/bsd/kern/sys_generic.c
++++ b/bsd/kern/sys_generic.c
+@@ -321,32 +321,7 @@ dofileread(vfs_context_t ctx, struct fileproc *fp,
+ 		return EINVAL;
+ 	}
+ 
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
+-	int rerr = fp_readv(ctx, fp, uio, flags, retval);
+-	/* lavender: dyld rejects some file of SpringBoard/chronod as all-zero; name it and show what read returned */
+-	proc_t rp = vfs_context_proc(ctx);
+-	if (rp != NULL && FILEGLOB_DTYPE(fp->fp_glob) == DTYPE_VNODE &&
+-	    (strcmp(rp->p_comm, "SpringBoard") == 0 || strcmp(rp->p_comm, "chronod") == 0)) {
+-		static int rdlogged;
+-		if (rdlogged++ < 400) {
+-			char path[MAXPATHLEN];
+-			int plen = sizeof(path);
+-			uint64_t w[2] = { 0, 0 };
+-			if (vn_getpath((vnode_t)fp_get_data(fp), path, &plen) != 0) {
+-				strlcpy(path, "?", sizeof(path));
+-			}
+-			if (rerr == 0 && *retval > 0) {
+-				(void)copyin(bufp, w, MIN(sizeof(w), (size_t)*retval));
+-			}
+-			printf("READ %s %s off %lld n %llu -> e%d r%lld %llx %llx\n", rp->p_comm, path,
+-			    (flags & FOF_OFFSET) ? (long long)offset : -1LL, (unsigned long long)nbyte, rerr,
+-			    (long long)*retval, (unsigned long long)w[0], (unsigned long long)w[1]);
+-		}
+-	}
+-	return rerr;
+-#else
+ 	return fp_readv(ctx, fp, uio, flags, retval);
+-#endif
+ }
+ 
+ static int
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 3adfcba..a20a764 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -873,19 +873,6 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
+ 	}
+ 	printf("%s\n", line);
+ 
+-	/* lavender: dyld finds a zero Mach-O header; is the mapped header page zero? */
+-	if (mh != 0) {
+-		static const uint32_t offs[] = { 0, 0x20, 0x1000, 0x3ff0, 0x4000 };
+-		n = snprintf(line, sizeof(line), "CRASH %s mhmem", name);
+-		for (size_t i = 0; i < sizeof(offs) / sizeof(offs[0]); i++) {
+-			uint64_t w[2] = { 0, 0 };
+-			int e = copyin((user_addr_t)(mh + offs[i]), w, sizeof(w));
+-			n += snprintf(line + n, sizeof(line) - n, " +%x:%s%llx", offs[i], e ? "E" : "",
+-			    (unsigned long long)w[0]);
+-		}
+-		printf("%s\n", line);
+-	}
+-
+ 	if (sig == 11 || sig == 10) {
+ 		/* Which mapping the faulting address is in, or which two it falls between. */
+ 		uint64_t far = (uint64_t)saved_state64(ss)->far;
