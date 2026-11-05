@@ -1,0 +1,47 @@
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index e7dc2c0..d49aa13 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -691,6 +691,42 @@ smmu_setup(void)
+ 	case 4:
+ 		smmu_step(0x0, rd(smmu, 0x0) & ~(1u << 10));    /* sCR0.USFCFG off: unmatched streams pass */
+ 		break;
++	case 6: {
++		/*
++		 * Firmware traps S2CR/SMR (arm-smmu-qcom.c: BYPASS is written as FAULT): a context bank with M=0
++		 * stands for bypass. gpu_cb: the bank; gpu_idx: the mapping group; gpu_vmid: CBAR VMID;
++		 * gpu_smrfirst: SMR before S2CR (Linux: S2CR first); gpu_m1: M=1 with empty tables.
++		 */
++		uint32_t cb = 0, idx = 0, vmid = 1, smrfirst = 0, m1 = 0;
++		(void)PE_parse_boot_argn("gpu_cb", &cb, sizeof(cb));
++		(void)PE_parse_boot_argn("gpu_idx", &idx, sizeof(idx));
++		(void)PE_parse_boot_argn("gpu_vmid", &vmid, sizeof(vmid));
++		(void)PE_parse_boot_argn("gpu_smrfirst", &smrfirst, sizeof(smrfirst));
++		(void)PE_parse_boot_argn("gpu_m1", &m1, sizeof(m1));
++		uint32_t cbo = SMMU_CB0 + 0x1000 * cb;
++		if (l1.va == NULL && !table_alloc(&l1)) {
++			return false;
++		}
++		smmu_step(cbo + 0x000, 0);
++		smmu_step(cbo + 0x058, 0xFFFFFFFF);
++		smmu_step(0x1000 + 0x800 + 4 * cb, 1);                          /* CBA2R: AArch64 */
++		smmu_step(0x1000 + 4 * cb, 0x0001f000 | vmid);                  /* CBAR */
++		smmu_step(cbo + 0x020, (uint32_t)l1.pa);
++		smmu_step(cbo + 0x024, (uint32_t)(l1.pa >> 32));
++		smmu_step(cbo + 0x030, 32 | (1u << 23));
++		smmu_step(cbo + 0x010, 1);
++		smmu_step(cbo + 0x038, 0x44);
++		smmu_step(cbo + 0x03C, 0);
++		smmu_step(cbo + 0x000, m1 ? 0x67 : 0x60);
++		if (smrfirst) {
++			smmu_step(0x800 + 4 * idx, (1u << 31) | (1u << 16));
++		}
++		smmu_step(0xC00 + 4 * idx, cb);                                 /* S2CR: translate through the bank */
++		if (!smrfirst) {
++			smmu_step(0x800 + 4 * idx, (1u << 31) | (1u << 16));
++		}
++		break;
++	}
+ 	case 5:
+ 		smmu_step(0xC04, 1u << 16);                     /* group 1: S2CR bypass */
+ 		smmu_step(0x804, (1u << 31) | (1u << 16));      /* SMR1: SID 0 mask 1 */
