@@ -1,0 +1,391 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index d7912b1..8276d11 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -107,6 +107,7 @@ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_emmc.c			standard
+ bsd/dev/sweet_wdt.c			standard
++bsd/dev/sweet_novatek.c		standard
+ bsd/dev/redwood_sta.c		standard
+ bsd/dev/redwood_net.c		standard
+ bsd/dev/redwood_apple80211.c	standard
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+index 61638ae..a2d4cd3 100644
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -1193,6 +1193,7 @@ extern uint64_t sweet_log_position(void);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern int hz;
++extern void sweet_novatek_init(void);
+ 
+ static char semmc_log_ring[SEMMC_LOG_RING];
+ static int semmc_log_chan;
+@@ -1329,6 +1330,7 @@ out:
+ 		SEMMC_LOG("init failed (errno %d)", err);
+ 	} else {
+ 		semmc_log_start();
++		sweet_novatek_init();
+ 	}
+ 	return err;
+ }
+diff --git a/bsd/dev/sweet_novatek.c b/bsd/dev/sweet_novatek.c
+new file mode 100644
+index 0000000..ef24a3d
+--- /dev/null
++++ b/bsd/dev/sweet_novatek.c
+@@ -0,0 +1,353 @@
++/*
++ * lavender: Novatek NT36672A touch (the panel's own IC) on BLSP1 QUP1 I2C.
++ * Facts from the OrangeFox kernel on this phone: c175000.i2c, NVT-ts, IRQ
++ * GPIO 67. Protocol from Linux novatek-nvt-ts.c, QUP v2 FIFO tags from
++ * i2c-qup.c, clocks and pins from gcc-sdm660.c, pinctrl-sdm660.c, sdm630.dtsi.
++ * Polled, one thread. Boot-arg lavtouch=0 turns it off; lavtouchdelay=<s>.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void sweet_novatek_init(void);
++
++#define GCC_PA                  0x00100000u
++#define GCC_BLSP1_VOTE          0x52004u
++#define GCC_BLSP1_AHB_BIT       (1u << 17)
++#define GCC_QUP1_RCG_CMD        0x19020u
++#define GCC_QUP1_RCG_CFG        0x19024u
++#define GCC_QUP1_CBCR           0x19008u
++#define TLMM_SOUTH_PA           0x03100000u
++#define TLMM_NORTH_PA           0x03940000u     /* north tile + 0x40000: GPIO 64.. */
++#define PIN_SDA_CTL             0x2000u
++#define PIN_SCL_CTL             0x3000u
++#define PIN_RESET_CTL           0x2000u         /* GPIO 66 */
++#define PIN_RESET_IO            0x2004u
++#define PIN_I2C_MUX             (3u << 2)
++#define QUP_PA                  0x0c174000u
++#define QUP_OFF                 0x1000u
++
++#define QUP_CONFIG              0x000u
++#define QUP_STATE               0x004u
++#define QUP_IO_MODE             0x008u
++#define QUP_SW_RESET            0x00cu
++#define QUP_OPERATIONAL         0x018u
++#define QUP_ERROR_FLAGS         0x01cu
++#define QUP_HW_VERSION          0x030u
++#define QUP_MX_OUTPUT_CNT       0x100u
++#define QUP_OUT_FIFO            0x110u
++#define QUP_MX_WRITE_CNT        0x150u
++#define QUP_MX_INPUT_CNT        0x200u
++#define QUP_MX_READ_CNT         0x208u
++#define QUP_IN_FIFO             0x218u
++#define QUP_I2C_CLK_CTL         0x400u
++#define QUP_I2C_STATUS          0x404u
++#define QUP_I2C_MASTER_GEN      0x408u
++
++#define ST_RESET                0u
++#define ST_RUN                  1u
++#define ST_PAUSE                3u
++#define ST_MASK                 3u
++#define ST_VALID                (1u << 2)
++#define ST_I2C_MAST             (1u << 4)
++#define OP_IN_NOT_EMPTY         (1u << 5)
++#define I2C_MINI_CORE_V2        ((2u << 8) | 7u)
++#define IO_REPACK               ((1u << 14) | (1u << 15))
++#define STATUS_NACK             (1u << 3)
++#define STATUS_ERRORS           0x38000fcu
++#define QUP_ERRORS              0x7cu
++/* 19.2 MHz XO, 400 kHz: fs_div = (48 - 6) * 2 / 3 = 28, as qup_i2c_probe */
++#define CLK_CTL_400K            ((14u << 16) | (3u << 8) | 28u)
++
++#define TAG_START               0x81u
++#define TAG_DATAWR              0x82u
++#define TAG_DATARD_STOP         0x87u
++
++#define NVT_ADDR                0x01u
++#define NVT_TOUCH_REG           0x00u
++#define NVT_PARAMS_REG          0x78u
++#define NVT_PARAMS_LEN          15u
++#define NVT_POINT_LEN           6u
++#define NVT_FINGERS             10u
++#define NVT_ACTIVE_NEW          1u
++#define NVT_ACTIVE_MOVE         2u
++/*
++ * SweetFramebuffer centres this 2340-line panel in 2436 lines (offset 48), but
++ * SweetHID assumes a 2400-line panel (offset 18).
++ */
++#define PANEL_TO_HID_Y          30
++
++static struct {
++	vm_offset_t gcc, south, north, qup;
++	uint32_t active;
++	int x[NVT_FINGERS], y[NVT_FINGERS];
++	unsigned logged;
++} nv;
++static int nv_chan;
++
++static inline uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dsb sy");
++	return v;
++}
++
++static inline void
++wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy");
++}
++
++static void
++nv_sleep(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&nv_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++nv_clocks(void)
++{
++	wr(nv.gcc, GCC_BLSP1_VOTE, rd(nv.gcc, GCC_BLSP1_VOTE) | GCC_BLSP1_AHB_BIT);
++	wr(nv.gcc, GCC_QUP1_RCG_CFG, 1u);       /* XO, divider 1 */
++	wr(nv.gcc, GCC_QUP1_RCG_CMD, rd(nv.gcc, GCC_QUP1_RCG_CMD) | 1u);
++	for (unsigned i = 0; (rd(nv.gcc, GCC_QUP1_RCG_CMD) & 1u) != 0; i++) {
++		if (i > 5000) {
++			printf("NVT: RCG update stuck cmd=%#x\n", rd(nv.gcc, GCC_QUP1_RCG_CMD));
++			return false;
++		}
++		delay(1);
++	}
++	wr(nv.gcc, GCC_QUP1_CBCR, rd(nv.gcc, GCC_QUP1_CBCR) | 1u);
++	for (unsigned i = 0; (rd(nv.gcc, GCC_QUP1_CBCR) & (1u << 31)) != 0; i++) {
++		if (i > 5000) {
++			printf("NVT: QUP1 clock stays off cbcr=%#x\n", rd(nv.gcc, GCC_QUP1_CBCR));
++			return false;
++		}
++		delay(1);
++	}
++	return true;
++}
++
++static int
++nv_state(uint32_t state)
++{
++	wr(nv.qup, QUP_STATE, state);
++	for (unsigned i = 0; i < 1000; i++) {
++		uint32_t s = rd(nv.qup, QUP_STATE);
++		if ((s & ST_VALID) && (s & ST_MASK) == state) {
++			return 0;
++		}
++		delay(1);
++	}
++	return ETIMEDOUT;
++}
++
++/* Register read as one QUP run: START w, reg, repeated START r, data, STOP. */
++static int
++nv_read(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len)
++{
++	const uint8_t tx[] = {
++		TAG_START, (uint8_t)(addr << 1), TAG_DATAWR, 1, reg,
++		TAG_START, (uint8_t)((addr << 1) | 1), TAG_DATARD_STOP, (uint8_t)len,
++	};
++	unsigned rx_total = 2 + len, got = 0, i;
++	int err;
++
++	wr(nv.qup, QUP_SW_RESET, 1);
++	for (i = 0; ; i++) {
++		uint32_t s = rd(nv.qup, QUP_STATE);
++		if ((s & ST_VALID) && (s & ST_MASK) == ST_RESET) {
++			break;
++		}
++		if (i > 1000) {
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++	wr(nv.qup, QUP_CONFIG, I2C_MINI_CORE_V2);
++	wr(nv.qup, QUP_I2C_MASTER_GEN, 1);
++	for (i = 0; (rd(nv.qup, QUP_STATE) & ST_I2C_MAST) == 0; i++) {
++		if (i > 1000) {
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++	wr(nv.qup, QUP_MX_OUTPUT_CNT, 0);
++	wr(nv.qup, QUP_MX_INPUT_CNT, 0);
++	wr(nv.qup, QUP_IO_MODE, IO_REPACK);
++	wr(nv.qup, QUP_MX_WRITE_CNT, sizeof(tx));
++	wr(nv.qup, QUP_MX_READ_CNT, rx_total);
++	wr(nv.qup, QUP_CONFIG, I2C_MINI_CORE_V2);
++	if ((err = nv_state(ST_RUN)) != 0) {
++		return err;
++	}
++	wr(nv.qup, QUP_I2C_CLK_CTL, CLK_CTL_400K);
++	if ((err = nv_state(ST_PAUSE)) != 0) {
++		return err;
++	}
++	for (i = 0; i < sizeof(tx); i += 4) {
++		uint32_t w = 0;
++		for (unsigned b = 0; b < 4 && i + b < sizeof(tx); b++) {
++			w |= (uint32_t)tx[i + b] << (b * 8);
++		}
++		wr(nv.qup, QUP_OUT_FIFO, w);
++	}
++	if ((err = nv_state(ST_RUN)) != 0) {
++		return err;
++	}
++	for (i = 0; got < rx_total; ) {
++		uint32_t bus = rd(nv.qup, QUP_I2C_STATUS) & STATUS_ERRORS;
++		uint32_t qe = rd(nv.qup, QUP_ERROR_FLAGS) & QUP_ERRORS;
++		if (bus != 0 || qe != 0) {
++			err = (bus & STATUS_NACK) ? ENXIO : EIO;
++			break;
++		}
++		if ((rd(nv.qup, QUP_OPERATIONAL) & OP_IN_NOT_EMPTY) == 0) {
++			if (++i > 20000) {      /* 20 ms; 62 bytes at 400 kHz take ~1.6 ms */
++				err = ETIMEDOUT;
++				break;
++			}
++			delay(1);
++			continue;
++		}
++		uint32_t w = rd(nv.qup, QUP_IN_FIFO);
++		for (unsigned b = 0; b < 4 && got < rx_total; b++, got++, w >>= 8) {
++			if (got >= 2) {         /* the first 2 are the echoed tags */
++				buf[got - 2] = (uint8_t)w;
++			}
++		}
++	}
++	(void)nv_state(ST_RESET);
++	return err;
++}
++
++static void
++nv_frame(const uint8_t *data)
++{
++	uint32_t mask = 0;
++
++	for (unsigned i = 0; i < NVT_FINGERS; i++) {
++		const uint8_t *p = data + i * NVT_POINT_LEN;
++		unsigned slot = p[0] >> 3, type = p[0] & 7u;
++		if (p[0] == 0xff || slot < 1 || slot > NVT_FINGERS ||
++		    (type != NVT_ACTIVE_NEW && type != NVT_ACTIVE_MOVE)) {
++			continue;
++		}
++		slot--;
++		mask |= 1u << slot;
++		int x = (p[1] << 4) | (p[3] >> 4), y = (p[2] << 4) | (p[3] & 0x0f);
++		if (!(nv.active & (1u << slot)) || x != nv.x[slot] || y != nv.y[slot]) {
++			sweet_hid_touch((int)slot, 1, x, y + PANEL_TO_HID_Y);
++			if (nv.logged < 40) {
++				nv.logged++;
++				printf("NVT: finger %u at %d,%d\n", slot, x, y);
++			}
++		}
++		nv.x[slot] = x;
++		nv.y[slot] = y;
++	}
++	for (unsigned s = 0; s < NVT_FINGERS; s++) {
++		if ((nv.active & ~mask) & (1u << s)) {
++			sweet_hid_touch((int)s, 0, nv.x[s], nv.y[s] + PANEL_TO_HID_Y);
++		}
++	}
++	nv.active = mask;
++}
++
++static void
++nv_thread(__unused void *arg, __unused wait_result_t result)
++{
++	unsigned delay_s = 60, errors = 0;
++	uint8_t params[NVT_PARAMS_LEN], data[NVT_POINT_LEN * NVT_FINGERS];
++	int err;
++
++	(void)PE_parse_boot_argn("lavtouchdelay", &delay_s, sizeof(delay_s));
++	printf("NVT: starting in %u s\n", delay_s);
++	nv_sleep(delay_s * 1000u);
++
++	nv.gcc = ml_io_map(GCC_PA, 0x94000);
++	nv.south = ml_io_map(TLMM_SOUTH_PA, 0x4000);
++	nv.north = ml_io_map(TLMM_NORTH_PA, 0x4000);
++	nv.qup = ml_io_map(QUP_PA, 0x4000);
++	if (!nv.gcc || !nv.south || !nv.north || !nv.qup) {
++		printf("NVT: MMIO mapping failed\n");
++		goto out;
++	}
++	nv.qup += QUP_OFF;
++	printf("NVT: before: vote=%#x cbcr=%#x sda=%#x scl=%#x rst=%#x/%#x\n",
++	    rd(nv.gcc, GCC_BLSP1_VOTE), rd(nv.gcc, GCC_QUP1_CBCR), rd(nv.south, PIN_SDA_CTL),
++	    rd(nv.south, PIN_SCL_CTL), rd(nv.north, PIN_RESET_CTL), rd(nv.north, PIN_RESET_IO));
++	if (!nv_clocks()) {
++		goto out;
++	}
++	wr(nv.south, PIN_SDA_CTL, PIN_I2C_MUX);
++	wr(nv.south, PIN_SCL_CTL, PIN_I2C_MUX);
++	printf("NVT: QUP version %#x\n", rd(nv.qup, QUP_HW_VERSION));
++
++	err = nv_read(NVT_ADDR, NVT_PARAMS_REG, params, NVT_PARAMS_LEN);
++	if (err != 0) {
++		printf("NVT: params err %d: pulsing reset GPIO66\n", err);
++		wr(nv.north, PIN_RESET_IO, rd(nv.north, PIN_RESET_IO) & ~2u);
++		wr(nv.north, PIN_RESET_CTL, 0x200u);
++		nv_sleep(20);
++		wr(nv.north, PIN_RESET_IO, rd(nv.north, PIN_RESET_IO) | 2u);
++		nv_sleep(500);
++		err = nv_read(NVT_ADDR, NVT_PARAMS_REG, params, NVT_PARAMS_LEN);
++	}
++	if (err != 0) {
++		uint8_t b = 0;
++		int e62 = nv_read(0x62, 0, &b, 1);
++		printf("NVT: no answer at 0x01 (err %d); 0x62 err %d val %#x; stopping\n", err, e62, b);
++		goto out;
++	}
++	printf("NVT: %dx%d, %u fingers, chip %#x\n", (params[4] << 8) | params[5],
++	    (params[6] << 8) | params[7], params[9], params[14]);
++
++	for (;;) {
++		err = nv_read(NVT_ADDR, NVT_TOUCH_REG, data, sizeof(data));
++		if (err != 0) {
++			if ((errors++ % 200u) == 0) {
++				printf("NVT: read err %d (count %u)\n", err, errors);
++			}
++			if (errors == 10) {
++				bzero(data, sizeof(data));
++				nv_frame(data);
++			}
++			nv_sleep(50);
++			continue;
++		}
++		errors = 0;
++		nv_frame(data);
++		nv_sleep(16);
++	}
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_novatek_init(void)
++{
++	uint32_t on = 1;
++	thread_t thread;
++
++	(void)PE_parse_boot_argn("lavtouch", &on, sizeof(on));
++	if (on && kernel_thread_start(nv_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
