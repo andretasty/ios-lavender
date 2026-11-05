@@ -1,0 +1,36 @@
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 4c9b53c..48866e2 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -665,18 +665,31 @@ smmu_setup(void)
+ 	}
+ 	IOLog("TopazGPU: smmu: tables at %#llx; idr0 %08x sCR0 %08x S2CR0 %08x SMR0 %08x CB0 sctlr %08x\n", l1.pa,
+ 	    rd(smmu, 0x20), rd(smmu, 0x0), rd(smmu, 0xC00), rd(smmu, 0x800), rd(smmu, SMMU_CB0));
++	IOLog("TopazGPU: smmu wr %s\n", "SMMU_CB0 + 0x000");
+ 	wr(smmu, SMMU_CB0 + 0x000, 0);                  /* SCTLR off while programming */
++	IOLog("TopazGPU: smmu wr %s\n", "SMMU_CB0 + 0x058");
+ 	wr(smmu, SMMU_CB0 + 0x058, 0xFFFFFFFF);         /* FSR clear */
++	IOLog("TopazGPU: smmu wr %s\n", "0x1000 + 0x800");
+ 	wr(smmu, 0x1000 + 0x800, 1);                    /* CBA2R0: AArch64 descriptors */
++	IOLog("TopazGPU: smmu wr %s\n", "0x1000");
+ 	wr(smmu, 0x1000, 0x0001f000);                   /* CBAR0: S1 translate, S2 bypass */
++	IOLog("TopazGPU: smmu wr %s\n", "SMMU_CB0 + 0x020");
+ 	wr(smmu, SMMU_CB0 + 0x020, (uint32_t)l1.pa);
++	IOLog("TopazGPU: smmu wr %s\n", "SMMU_CB0 + 0x024");
+ 	wr(smmu, SMMU_CB0 + 0x024, (uint32_t)(l1.pa >> 32));
++	IOLog("TopazGPU: smmu wr %s\n", "SMMU_CB0 + 0x030");
+ 	wr(smmu, SMMU_CB0 + 0x030, 32 | (1u << 23));    /* TCR: T0SZ 32, 4 KB, NC walks, EPD1 */
++	IOLog("TopazGPU: smmu wr %s\n", "SMMU_CB0 + 0x010");
+ 	wr(smmu, SMMU_CB0 + 0x010, 1);                  /* TCR2: PASize 36 bits */
++	IOLog("TopazGPU: smmu wr %s\n", "SMMU_CB0 + 0x038");
+ 	wr(smmu, SMMU_CB0 + 0x038, 0x44);               /* MAIR0: attr0 = Normal non-cacheable */
++	IOLog("TopazGPU: smmu wr %s\n", "SMMU_CB0 + 0x03C");
+ 	wr(smmu, SMMU_CB0 + 0x03C, 0);
++	IOLog("TopazGPU: smmu wr %s\n", "SMMU_CB0 + 0x000");
+ 	wr(smmu, SMMU_CB0 + 0x000, gpu_identity ? 0xE0 : 0x67);    /* SCTLR: M=0 pass-through, or CFIE CFRE AFE TRE M */
++	IOLog("TopazGPU: smmu wr %s\n", "0xC00");
+ 	wr(smmu, 0xC00, 0);                             /* S2CR0 -> CB0 */
++	IOLog("TopazGPU: smmu wr %s\n", "0x800");
+ 	wr(smmu, 0x800, (1u << 31) | (1u << 16));       /* SMR0: SID 0 mask 1 */
+ 	smmu_on = true;
+ 	tlb_flush();
