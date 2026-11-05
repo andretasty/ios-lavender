@@ -1,0 +1,58 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index e17297a..98a576b 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -29,6 +29,8 @@
+  * are remembered. Notifications, ownership and timestamps are accepted and
+  * ignored (logged once per selector).
+  */
++#include <mach/mach_time.h>
++#include <kern/clock.h>
+ #include "SweetSurface.h"
+ 
+ #if defined(SWEET)
+@@ -1092,10 +1094,21 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 					mem = sweet_res_take(take);
+ 				}
+ 			}
+-			if (mem == NULL && gpu_low && take <= (16u << 20)) {
++			/*
++			 * lavender: a big contiguous request that fails scans all RAM, runs zone_gc and yields: hundreds
++			 * of ms, a thousand times in ten minutes. After a failure big ones wait 30 s before trying again.
++			 */
++			static uint64_t contig_retry_at;
++			bool big = take > (2u << 20);
++			if (mem == NULL && gpu_low && take <= (16u << 20) && !(big && mach_absolute_time() < contig_retry_at)) {
+ 				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, take,
+ 				    0x0000000FFFFFC000ull);
++				if (mem == NULL && big) {
++					uint64_t wait;
++					nanoseconds_to_absolutetime(30ULL * NSEC_PER_SEC, &wait);
++					contig_retry_at = mach_absolute_time() + wait;
++				}
+ 			}
+ 			if (mem == NULL) {
+ 				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index 437adb1..7f382a4 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1075,6 +1075,17 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+ #if defined(SWEET)
+ 	/* No CPU/thread/debugger state is required for this first panic copy. */
+ 	sweet_early_panic(panic_format_str, panic_args);
++	/* lavender: the reason, into the log too: it can reset before the normal panic print */
++	static int panic_printed;
++	if (!panic_printed) {
++		panic_printed = 1;
++		va_list panic_copy;
++		va_copy(panic_copy, *panic_args);
++		printf("PANIC caller %p: ", (void *)panic_caller);
++		vprintf(panic_format_str, panic_copy);
++		printf("\n");
++		va_end(panic_copy);
++	}
+ #endif
+ 
+ #if defined(__x86_64__) && (DEVELOPMENT || DEBUG)
