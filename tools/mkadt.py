@@ -264,6 +264,10 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
     ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu or LAVENDER else [ufs])
+       # lavender: GPU firmware from the phone's vendor partition, on the PC only (TopazAdreno.cpp fw_get)
+       + ([node('gpu-fw', [ph()] + [(k, open(os.path.join(os.environ['LAV_GPUFW'], f), 'rb').read()) for k, f in
+                               (('pm4', 'a530_pm4.fw'), ('pfp', 'a530_pfp.fw'), ('zap-mdt', 'a512_zap.mdt'), ('zap-b02', 'a512_zap.b02'))])]
+          if LAVENDER and os.environ.get('LAV_GPUFW') else [])
        # lavender: console mirrored into Linux's ramoops console zone (patch 0960)
        + ([node('sweet-pstore', [ph(), ('reg', u64(0xa0000000, 0x200000))]),
            # lavender: SDCC1 eMMC host (sdhci@c0c4000 hc_mem) for the read-only root (patch 0962)

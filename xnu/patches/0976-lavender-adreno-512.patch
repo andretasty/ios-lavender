@@ -1,0 +1,703 @@
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 16da336..a5b6255 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -16,11 +16,19 @@
+  * (/usr/share/firmware/topaz/{a610_zap.mdt,a610_zap.b02,a630_sqe.fw}), starts
+  * the GPU and publishes the RedwoodGPU service. gpu_mhz=600 runs the core at
+  * 600 MHz instead of 300.
++ *
++ * lavender: Adreno 512 (SDM660). Linux a5xx_gpu.c and gpucc-sdm660.c are the
++ * sequences here. Firmware comes from the ADT /gpu-fw node, built on the PC
++ * from the phone's vendor partition, so it never enters this public repo.
++ * Boot-arg gpu_step=N stops after a bring-up step: 1 power and register test,
++ * 2 SMMU, 3 CP running, 4 zap and leave secure mode, 5 a fence. 0: all, and
++ * publish RedwoodGPU.
+  */
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/IOLocks.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
+ 
+@@ -34,8 +42,6 @@ void topaz_fw_free(void *data, size_t size);
+ int topaz_root_mounted(void);
+ void RedwoodGPUStart(void);
+ void topaz_adreno_init(void);
+-extern const uint8_t topaz_fw_zap_mdt[], topaz_fw_zap_b02[], topaz_fw_sqe_fw[];
+-extern const size_t topaz_fw_zap_mdt_size, topaz_fw_zap_b02_size, topaz_fw_sqe_fw_size;
+ 
+ bool redwood_gpu_ready(void);
+ bool redwood_gpu_parameter(uint32_t which, uint64_t *value);
+@@ -55,17 +61,18 @@ void redwood_tl(const char *format, ...) __printflike(1, 2);
+ uint32_t gpu_log;
+ }
+ 
+-#define GCC_BASE        0x01400000ull
+-#define GCC_SIZE        0x80000
+-#define GPUCC_BASE      0x05990000ull
+-#define GPUCC_SIZE      0x9000
+-#define GPU_BASE        0x05900000ull
++#define GCC_BASE        0x00100000ull
++#define GCC_SIZE        0x94000
++#define GPUCC_BASE      0x05064000ull       /* 16 KB aligned: the registers start at +0x1000 */
++#define GPUCC_OFF       0x1000
++#define GPUCC_SIZE      0xC000
++#define GPU_BASE        0x05000000ull
+ #define GPU_SIZE        0x40000
+-#define SMMU_BASE       0x059A0000ull
++#define SMMU_BASE       0x05040000ull
+ #define SMMU_SIZE       0x10000
+ #define SMMU_CB0        0x8000
+-#define ZAP_REGION      0x55B15000ull
+-#define ZAP_REGION_SIZE 0x2000
++#define ZAP_REGION      0xa1000000ull       /* below the kernel: RAM nothing else uses (mkadt LAV_MEMBASE) */
++#define ZAP_REGION_SIZE 0x4000
+ #define GPU_PAS_ID      13
+ 
+ #define CBCR_EN         (1u << 0)
+@@ -93,7 +100,7 @@ uint32_t gpu_log;
+ 
+ #define VA_USER_START       0x01000000ull
+ #define VA_KERNEL           0xF0000000ull
+-#define GMEM_SIZE           0x21000             /* 128K + 4K (bengal), TopazGpuW */
++#define GMEM_SIZE           0x44000             /* a512: 256K + 16K (a5xx_catalog.c) */
+ #define GMEM_BASE           0x100000
+ /* topaz: all kernel RAM is the upper DDR bank (0x1_40000000+): the SMMU takes 36-bit output addresses */
+ #define LOW_MASK            0x0000000ffffff000ull
+@@ -102,7 +109,7 @@ uint32_t gpu_log;
+ 
+ static volatile uint8_t *gcc, *gpucc, *gpu, *smmu;
+ static bool ready, failed, smmu_on;
+-static uint32_t wptr, seqno, core_mhz = 300;
++static uint32_t wptr, seqno, core_mhz = 300, gpu_step;
+ static IOLock *hw_lock;
+ 
+ struct kbuf {
+@@ -110,7 +117,7 @@ struct kbuf {
+ 	uint8_t *va;
+ 	uint64_t pa, iova, size;
+ };
+-static struct kbuf ring, sqe, mem;
++static struct kbuf ring, pm4, pfp, mem;
+ static uint64_t kernel_va_next = VA_KERNEL;
+ 
+ /* ---------------------------------------------------------------- MMIO */
+@@ -159,7 +166,7 @@ kbuf_pa(struct kbuf *b, uint64_t off)
+  * reserved regions in the stock DT, not given to the kernel): a pool of it is
+  * the GPU's, mapped write-combined (Normal non-cacheable: no cache upkeep).
+  */
+-#define GPU_POOL_BASE       0x90000000ull
++#define GPU_POOL_BASE       0xa2000000ull       /* lavender: 1 GB left below the kernel (mkadt LAV_MEMBASE=0xe2000000) */
+ #define GPU_POOL_SIZE       0x40000000ull       /* 1 GB */
+ #define GPU_POOL_UNIT       0x10000ull          /* 64 KB */
+ #define GPU_POOL_CHUNK      0x4000000ull        /* 64 MB: mapped on first use (1 GB at once is more IO space than there is) */
+@@ -361,84 +368,13 @@ kbuf_alloc_high(struct kbuf *b, uint64_t size)
+ 	return true;
+ }
+ 
+-/* ---------------------------------------------------------------- gpu_cc_pll0 (topaz-woa TopazGpuW v0.43) */
+-
+-/*
+- * Zonda PLL at GPU CC + 0, sequence from the stock khaje kernel (gpucc-khaje.c, clk-alpha-pll.c):
+- * f = 19.2 MHz * (L + alpha / 2^16) at the stock OPPs. The GX voltage corner is not voted (RPM):
+- * high rates run on whatever the bootloader left and may hang (gpu_mhz is opt-in).
+- */
+-#define ZP_MODE        0x00
+-#define ZP_L           0x04
+-#define ZP_ALPHA       0x08
+-#define ZP_USER        0x0c
+-#define ZP_CFG         0x10
+-#define ZP_CFG_U       0x14
+-#define ZP_CFG_U1      0x18
+-#define ZP_OPMODE      0x28
+-#define ZP_BYPASSNL    (1u << 1)
+-#define ZP_RESET_N     (1u << 2)
+-#define ZP_OUTCTRL     (1u << 0)
+-#define ZP_LOCK        (1u << 31)
+-
+-static bool
+-zonda_la(uint32_t mhz, uint32_t *l, uint32_t *a)
+-{
+-	static const uint32_t t[][3] = {
+-		{ 320, 17, 0xAAAB }, { 465, 24, 0x3800 }, { 600, 31, 0x4000 }, { 785, 41, 0xE2AA }, { 820, 43, 0xB555 },
+-		{ 980, 51, 0x0AAB }, { 1025, 53, 0x62AA }, { 1100, 57, 0x4AAB }, { 1260, 66, 0xA000 },
+-	};
+-	for (unsigned i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+-		if (t[i][0] == mhz) {
+-			*l = t[i][1];
+-			*a = t[i][2];
+-			return true;
+-		}
+-	}
+-	return false;
+-}
+-
+-static bool
+-gpu_pll_start(uint32_t mhz)
+-{
+-	uint32_t l, a;
+-
+-	if (!zonda_la(mhz, &l, &a)) {
+-		IOLog("TopazGPU: gpu_mhz=%u is not a stock OPP (320 465 600 785 820 980 1025 1100 1260)\n", mhz);
+-		return false;
+-	}
+-	rmw(gpucc, ZP_MODE, ZP_OUTCTRL, 0);
+-	wr(gpucc, ZP_OPMODE, 0);
+-	wr(gpucc, ZP_L, l);
+-	wr(gpucc, ZP_ALPHA, a);
+-	wr(gpucc, ZP_CFG, 0x08200800);
+-	wr(gpucc, ZP_CFG_U, 0x05022001);
+-	wr(gpucc, ZP_CFG_U1, 0x00000010);
+-	wr(gpucc, ZP_USER, 0x01000101);
+-	rmw(gpucc, ZP_MODE, ZP_BYPASSNL, 0);
+-	rmw(gpucc, ZP_MODE, 0, ZP_RESET_N);
+-	rmw(gpucc, ZP_MODE, 0, ZP_BYPASSNL);
+-	IODelay(1);
+-	rmw(gpucc, ZP_MODE, 0, ZP_RESET_N);
+-	wr(gpucc, ZP_OPMODE, 1);
+-	if (!poll(gpucc, ZP_MODE, ZP_LOCK, ZP_LOCK, 1000)) {
+-		IOLog("TopazGPU: gpu_cc_pll0: no lock at %u MHz (mode %08x)\n", mhz, rd(gpucc, ZP_MODE));
+-		return false;
+-	}
+-	rmw(gpucc, ZP_USER, 0, 0xF);
+-	rmw(gpucc, ZP_MODE, 0, ZP_OUTCTRL);
+-	IODelay(100);
+-	IOLog("TopazGPU: gpu_cc_pll0 locked at %u MHz (l %u alpha %04x)\n", mhz, l, a);
+-	return true;
+-}
+-
+ /* ---------------------------------------------------------------- power (TopazGpuW PowerUp) */
+ 
+ static bool
+ branch_on(volatile uint8_t *b, uint32_t o, const char *name)
+ {
+ 	rmw(b, o, 0, CBCR_EN);
+-	bool ok = poll(b, o, CBCR_OFF, 0, 200);
++	bool ok = poll(b, o, CBCR_OFF, 0, 500);
+ 	if (!ok) {
+ 		IOLog("TopazGPU: %s stays off (%08x)\n", name, rd(b, o));
+ 	}
+@@ -453,82 +389,50 @@ rcg_set(uint32_t cmd, uint32_t src, uint32_t div)
+ 	return poll(gpucc, cmd, RCG_UPDATE, 0, 500);
+ }
+ 
+-static bool
+-gdsc_on(uint32_t gdscr, uint32_t bcr, uint32_t clamp, uint32_t status)
+-{
+-	if (bcr != 0) {
+-		rmw(gpucc, bcr, 0, 1);
+-		IODelay(1);
+-		rmw(gpucc, bcr, 1, 0);
+-	}
+-	if (clamp != 0) {
+-		rmw(gpucc, clamp, 1, 0);
+-	}
+-	rmw(gpucc, gdscr, GDSC_COLLAPSE, 0);
+-	IODelay(1);
+-	return poll(gpucc, status, GDSC_PWR_ON, GDSC_PWR_ON, 500);
+-}
+-
+-static void
+-power_cycle_if_on(void)
+-{
+-	if ((rd(gpucc, 0x100c) & GDSC_PWR_ON) == 0 && (rd(gpucc, 0x1540) & GDSC_PWR_ON) == 0) {
+-		return;
+-	}
+-	IOLog("TopazGPU: already powered (GX %08x CX %08x): power cycling\n", rd(gpucc, 0x100c), rd(gpucc, 0x1540));
+-	if (rd(gpucc, 0x100c) & GDSC_PWR_ON) {
+-		wr(gpu, 4 * 0x808, 0);                  /* CP_SQE_CNTL: stop */
+-	}
+-	rmw(gpucc, 0x1054, CBCR_EN, 0);
+-	rmw(gpucc, 0x100c, 0, GDSC_COLLAPSE);
+-	rmw(gpucc, 0x1508, 0, 1);
+-	poll(gpucc, 0x100c, GDSC_PWR_ON, 0, 1000);
+-	rmw(gpucc, 0x1098, CBCR_EN, 0);
+-	rmw(gpucc, 0x106c, 0, GDSC_COLLAPSE);
+-	IODelay(1000);
+-}
+-
+ static bool
+ power_up(void)
+ {
+-	power_cycle_if_on();
+-	rmw(gcc, 0x79004, 0, 1u << 15);                 /* GPLL0 to the GPU CC */
+-	branch_on(gcc, 0x71154, "gcc_bimc_gpu_axi");
+-	branch_on(gcc, 0x3600c, "gcc_gpu_memnoc_gfx");
+-	branch_on(gcc, 0x36018, "gcc_gpu_snoc_dvm_gfx");
+-	if (!gdsc_on(0x106c, 0, 0, 0x1540)) {
+-		IOLog("TopazGPU: CX GDSC: no PWR_ON\n");
++	wr(gcc, 0x5200c, rd(gcc, 0x5200c) | (1u << 4) | (1u << 3));     /* GPLL0 and its /2 to the GPU CC */
++	branch_on(gcc, 0x71004, "gcc_gpu_cfg_ahb");
++	branch_on(gcc, 0x7106c, "gcc_bimc_gfx");
++	branch_on(gcc, 0x71010, "gcc_gpu_bimc_gfx");
++	IOLog("TopazGPU: before: CX %08x/%08x GX %08x cxo %08x gfx3d %08x clamp %08x\n", rd(gpucc, 0x1004), rd(gpucc, 0x1008),
++	    rd(gpucc, 0x1094), rd(gpucc, 0x1020), rd(gpucc, 0x1098), rd(gpucc, 0x130));
++	branch_on(gpucc, 0x1020, "gpucc_cxo");
++	rmw(gpucc, 0x1004, GDSC_COLLAPSE, 0);                           /* CX (gds_hw_ctrl reports it) */
++	IODelay(1);
++	if (!poll(gpucc, 0x1008, GDSC_PWR_ON, GDSC_PWR_ON, 500)) {
++		IOLog("TopazGPU: CX GDSC: no PWR_ON (%08x)\n", rd(gpucc, 0x1008));
+ 		return false;
+ 	}
+-	if (!branch_on(gpucc, 0x109c, "gpucc_cxo") || !branch_on(gpucc, 0x1078, "gpucc_ahb")) {
++	rcg_set(0x10b0, 0, 1);                                          /* rbbmtimer: XO */
++	branch_on(gpucc, 0x10d0, "gpucc_rbbmtimer");
++	rcg_set(0x1030, 0, 1);                                          /* rbcpr: XO */
++	branch_on(gpucc, 0x1054, "gpucc_rbcpr");
++	/* GX: bcr reset, AON reset, clamp off, unclamp logic (gdsc.c: SW_RESET | CLAMP_IO | AON_RESET) */
++	rmw(gpucc, 0x1090, 0, 1);
++	IODelay(1);
++	rmw(gpucc, 0x1090, 1, 0);
++	rmw(gpucc, 0x130, 0, 1u << 4);
++	IODelay(1);
++	rmw(gpucc, 0x130, 1u << 4, 0);
++	rmw(gpucc, 0x130, 1, 0);
++	rmw(gpucc, 0x1094, GDSC_COLLAPSE, 0);
++	IODelay(1);
++	if (!poll(gpucc, 0x1094, GDSC_PWR_ON, GDSC_PWR_ON, 2000)) {
++		IOLog("TopazGPU: GX GDSC: no PWR_ON (%08x): the rail is off?\n", rd(gpucc, 0x1094));
+ 		return false;
+ 	}
+-	rcg_set(0x1120, SRC_GPLL0, 3);                  /* gmu 200 MHz */
+-	rmw(gpucc, 0x1098, 0xFF0, 0xFF0);
+-	branch_on(gpucc, 0x1098, "gpucc_cx_gmu");
+-	branch_on(gpucc, 0x5000, "gpucc_hlos1_vote_gpu_smmu");
+-	if (!gdsc_on(0x100c, 0x1008, 0x1508, 0x100c)) {
+-		IOLog("TopazGPU: GX GDSC: no PWR_ON\n");
++	/* gfx3d: GPLL0 / 2. The GX voltage corner is not voted: stays on what the bootloader left. */
++	if (!rcg_set(0x1070, SRC_GPLL0, 2)) {
++		IOLog("TopazGPU: gfx3d RCG stuck\n");
+ 		return false;
+ 	}
+-	/* gfx3d: 300/600 MHz from GPLL0 (/2, /1), other stock OPPs from gpu_cc_pll0 (the GX corner is not voted) */
+-	if (core_mhz != 300 && core_mhz != 600 && gpu_pll_start(core_mhz)) {
+-		if (!rcg_set(0x101c, 1, 1)) {                   /* parent 1 = GPU_CC_PLL0_OUT_MAIN */
+-			return false;
+-		}
+-	} else {
+-		if (core_mhz != 300 && core_mhz != 600) {
+-			core_mhz = 300;
+-		}
+-		if (!rcg_set(0x101c, SRC_GPLL0, core_mhz >= 600 ? 1 : 2)) {
+-			return false;
+-		}
+-	}
+-	rmw(gpucc, 0x1054, 0, (1u << 14) | (1u << 13));
+-	if (!branch_on(gpucc, 0x1054, "gpucc_gx_gfx3d")) {
++	rmw(gpucc, 0x1098, 0, (1u << 14) | (1u << 13));                 /* FORCE_MEM_CORE/PERIPH_ON */
++	if (!branch_on(gpucc, 0x1098, "gpucc_gfx3d")) {
+ 		return false;
+ 	}
+-	branch_on(gpucc, 0x1060, "gpucc_gx_cxo");
++	IODelay(20);
+ 	return true;
+ }
+ 
+@@ -565,19 +469,34 @@ scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	return args[0];
+ }
+ 
++/* Firmware from the ADT (tools/mkadt.py, LAV_GPUFW). */
++static bool
++fw_get(const char *name, const void **data, size_t *size)
++{
++	DTEntry entry;
++	unsigned int n = 0;
++
++	if (SecureDTLookupEntry(NULL, "/gpu-fw", &entry) != kSuccess ||
++	    SecureDTGetProperty(entry, name, data, &n) != kSuccess || n == 0) {
++		return false;
++	}
++	*size = n;
++	return true;
++}
++
+ static bool
+ zap_load(void)
+ {
+-	void *mdt = NULL, *seg = NULL;
++	const void *mdt = NULL, *seg = NULL;
+ 	size_t mdt_size = 0, seg_size = 0;
+ 	struct kbuf meta = {};
+ 	bool ok = false;
+ 
+-	IOLog("TopazGPU: zap: embedded firmware (%zu + %zu bytes)\n", topaz_fw_zap_mdt_size, topaz_fw_zap_b02_size);
+-	mdt = (void *)topaz_fw_zap_mdt;
+-	mdt_size = topaz_fw_zap_mdt_size;
+-	seg = (void *)topaz_fw_zap_b02;
+-	seg_size = topaz_fw_zap_b02_size;
++	if (!fw_get("zap-mdt", &mdt, &mdt_size) || !fw_get("zap-b02", &seg, &seg_size)) {
++		IOLog("TopazGPU: zap: firmware missing from the ADT\n");
++		return false;
++	}
++	IOLog("TopazGPU: zap: firmware %zu + %zu bytes\n", mdt_size, seg_size);
+ 	{
+ 		const uint8_t *m = (const uint8_t *)mdt;
+ 		uint32_t phoff = *(const uint32_t *)(m + 28), phnum = *(const uint16_t *)(m + 44);
+@@ -607,7 +526,7 @@ zap_load(void)
+ 		memcpy(meta.va, mdt, mdt_size);
+ 		sweet_dcache_clean((vm_offset_t)meta.va, (unsigned)mdt_size);
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+-		scm(SCM_FN(SCM_SVC_PIL, PIL_SHUTDOWN), 1, GPU_PAS_ID, 0, 0, &res);
++		/* (willow: no PIL_SHUTDOWN first, TrustZone can hang on a GPU it never booted) */
+ 		st = scm(SCM_FN(SCM_SVC_PIL, PIL_INIT_IMAGE), 2 | (SCM_ARG_RW << 6), GPU_PAS_ID, meta.pa, 0, &res);
+ 		if (st != 0 || res != 0) {
+ 			IOLog("TopazGPU: zap init_image: %llx/%llx\n", st, res);
+@@ -881,102 +800,126 @@ ring_idle(uint32_t ms)
+ 		IODelay(10);
+ 	}
+ 	IOLog("TopazGPU: ring stuck: rptr %u wptr %u RBBM_STATUS %08x CP_HW_FAULT %08x\n", gpu_rd(0x806),
+-	    wptr % RB_DWORDS, gpu_rd(0x210), gpu_rd(0x821));
++	    wptr % RB_DWORDS, gpu_rd(0x4f5), gpu_rd(0xb1a));
+ 	smmu_fault("ring");
+ 	return false;
+ }
+ 
+-static const uint32_t a612_hwcg[][2] = {        /* Linux a6xx_catalog.c a612_hwcg (a610 uses it) */
+-	{ 0x000B0, 0x22222222 }, { 0x000B4, 0x02222220 }, { 0x000B8, 0x00000081 }, { 0x000BC, 0x0000f3cf },
+-	{ 0x000C0, 0x22222222 }, { 0x000C4, 0x22222222 }, { 0x000C8, 0x22222222 }, { 0x000CC, 0x00022222 },
+-	{ 0x000D0, 0x11111111 }, { 0x000D4, 0x11111111 }, { 0x000D8, 0x11111111 }, { 0x000DC, 0x00011111 },
+-	{ 0x000E0, 0x77777777 }, { 0x000E4, 0x77777777 }, { 0x000E8, 0x77777777 }, { 0x000EC, 0x00077777 },
+-	{ 0x000F0, 0x22222222 }, { 0x000F4, 0x01202222 }, { 0x000F8, 0x00002220 }, { 0x00100, 0x00040f00 },
+-	{ 0x00104, 0x05522022 }, { 0x00105, 0x00005555 }, { 0x00106, 0x00000011 }, { 0x00107, 0x00445044 },
+-	{ 0x00108, 0x04222222 }, { 0x00111, 0x00002222 }, { 0x00114, 0x02222222 }, { 0x00117, 0x00000002 },
+-	{ 0x0011B, 0x00002222 }, { 0x00109, 0x00004000 }, { 0x00112, 0x00002222 }, { 0x00115, 0x00000200 },
+-	{ 0x0011C, 0x00000000 }, { 0x0010A, 0x00000000 }, { 0x00113, 0x00000000 }, { 0x00116, 0x04104004 },
+-	{ 0x0011D, 0x00000000 }, { 0x0010B, 0x22222222 }, { 0x00110, 0x00000004 }, { 0x0010F, 0x00000002 },
+-	{ 0x00533, 0x00000182 }, { 0x00044, 0x00000000 }, { 0x00042, 0x00000000 }, { 0x00118, 0x00000222 },
+-	{ 0x00119, 0x00000111 }, { 0x0011A, 0x00000555 },
++static const uint32_t a512_hwcg[][2] = {	/* Linux a5xx_gpu.c, offsets from a5xx.xml */
++	{ 0x0068, 0x02222222 }, { 0x0069, 0x02222222 }, { 0x006c, 0x02222220 }, { 0x006d, 0x02222220 },
++	{ 0x0070, 0x0000f3cf }, { 0x0071, 0x0000f3cf }, { 0x0074, 0x00000080 }, { 0x0075, 0x00000080 },
++	{ 0x004a, 0x22222222 }, { 0x004b, 0x22222222 }, { 0x004e, 0x22222222 }, { 0x004f, 0x22222222 },
++	{ 0x0052, 0x00002222 }, { 0x0053, 0x00002222 }, { 0x00b0, 0x77777777 }, { 0x00b1, 0x77777777 },
++	{ 0x00b4, 0x77777777 }, { 0x00b5, 0x77777777 }, { 0x00b8, 0x00007777 }, { 0x00b9, 0x00007777 },
++	{ 0x00a4, 0x11111111 }, { 0x00a5, 0x11111111 }, { 0x00a8, 0x11111111 }, { 0x00a9, 0x11111111 },
++	{ 0x00ac, 0x00001111 }, { 0x00ad, 0x00001111 }, { 0x005a, 0x22222222 }, { 0x005b, 0x22222222 },
++	{ 0x005c, 0x22222222 }, { 0x005d, 0x00222222 }, { 0x005e, 0x00444444 }, { 0x005f, 0x00000002 },
++	{ 0x0078, 0x22222222 }, { 0x0079, 0x22222222 }, { 0x007c, 0x00222222 }, { 0x007d, 0x00222222 },
++	{ 0x0082, 0x00022220 }, { 0x0083, 0x00022220 }, { 0x008a, 0x05522222 }, { 0x008b, 0x00505555 },
++	{ 0x0086, 0x04040404 }, { 0x0087, 0x04040404 }, { 0x0080, 0x07444044 }, { 0x008c, 0x00000002 },
++	{ 0x008d, 0x00000002 }, { 0x0081, 0x00010011 }, { 0x0063, 0x04222222 }, { 0x0060, 0x02222222 },
++	{ 0x0091, 0x00002222 }, { 0x0064, 0x00000000 }, { 0x0062, 0x04104004 }, { 0x0090, 0x00000000 },
++	{ 0x0066, 0x00000000 }, { 0x0065, 0x00004000 }, { 0x0061, 0x00000200 }, { 0x0092, 0x00002222 },
+ };
+ 
++#define PROTECT_RW(reg, log2len)        ((1u << 30) | (1u << 29) | ((uint32_t)(log2len) << 24) | (((uint32_t)(reg) << 2) & 0xFFFFF))
++
+ static void
+ hw_init_regs(void)
+ {
+-	static const uint32_t addr_mode[] = { 0x842, 0xC01, 0x8601, 0x8e05, 0x9e01, 0xbe05, 0xa601, 0x9601, 0xE00,
+-		                              0xae01, 0xb601, 0xF810 };
+-
+-	gpu_wr(0x3c45, 0);
+-	(void)gpu_rd(0x3c45);
+-	gpu_wr(0x16, 0);
+-	(void)gpu_rd(0x16);
+-	gpu_wr(0xF803, 0);
+-	gpu_wr64(0xF800, 0);
+-	gpu_wr(0xF802, 0);
++	static const uint32_t addr_mode[] = { 0x860, 0xbc1, 0xc81, 0xcc5, 0xd01, 0xe05, 0xe41, 0xe61, 0xe80, 0xec1, 0xf01, 0xf810 };
++	static const uint32_t protect[] = {
++		PROTECT_RW(0x04, 2), PROTECT_RW(0x08, 3), PROTECT_RW(0x10, 4), PROTECT_RW(0x20, 5), PROTECT_RW(0x40, 6),
++		PROTECT_RW(0x80, 6), PROTECT_RW(0xf800, 4), PROTECT_RW(0xf400, 1), PROTECT_RW(0x800, 6), PROTECT_RW(0x840, 3),
++		PROTECT_RW(0x880, 5), PROTECT_RW(0xAA0, 0), PROTECT_RW(0xCC0, 0), PROTECT_RW(0xCF0, 1), PROTECT_RW(0xE68, 3),
++		PROTECT_RW(0xE70, 4), PROTECT_RW(0xE80, 4), PROTECT_RW(0x10000, 15),
++	};
++
++	/* a5xx_pm_resume: a512 has no GPMU, RBBM suspend/resume by hand */
++	gpu_wr(0x67, 0x00000055);
++	for (unsigned i = 0; i < sizeof(a512_hwcg) / sizeof(a512_hwcg[0]); i++) {
++		gpu_wr(a512_hwcg[i][0], a512_hwcg[i][1]);
++	}
++	gpu_wr(0x67, 0xAAA8AA00);
++	gpu_wr(0x533, 0x182);
++	gpu_wr(0x67, gpu_rd(0x67) & ~0xffu);
++
++	/* a5xx_hw_init */
++	gpu_wr(0x3049, 3);                              /* VBIF_ROUND_ROBIN_QOS_ARB */
++	gpu_wr(0x302a, 9);                              /* VBIF_GATE_OFF_WRREQ_EN */
++	gpu_wr(0x46f, 0xffffffff);                      /* RBBM_PERFCTR_GPU_BUSY_MASKED */
++	gpu_wr(0x93, 1);                                /* RBBM_AHB_CNTL0 */
++	gpu_wr(0x2f, (1u << 30) | 0xFFFF);              /* RBBM_INTERFACE_HANG_INT_CNTL */
++	gpu_wr(0x464, 1);                               /* RBBM_PERFCTR_CNTL */
++	gpu_wr(0xe96, 2);                               /* UCHE_CACHE_WAYS */
++	gpu_wr64(0xe89, 0x1fffffffff000ull);            /* UCHE_TRAP_BASE */
++	gpu_wr64(0xe87, 0x1fffffffff000ull);            /* UCHE_WRITE_THRU_BASE */
++	gpu_wr64(0xe8b, GMEM_BASE);
++	gpu_wr64(0xe8d, GMEM_BASE + GMEM_SIZE - 1);
++	gpu_wr(0x825, 0x40);                            /* CP_MEQ_THRESHOLDS */
++	gpu_wr(0x826, 0x400);                           /* CP_MERCIU_SIZE */
++	gpu_wr(0x820, 0x80000060);                      /* CP_ROQ_THRESHOLDS_2 */
++	gpu_wr(0x81f, 0x40201B16);                      /* CP_ROQ_THRESHOLDS_1 */
++	gpu_wr(0xd00, (0x200u << 11) | (0x200u << 22)); /* PC_DBG_ECO_CNTL */
++	gpu_wr(0xcc4, gpu_rd(0xcc4) | (1u << 9));       /* RB_DBG_ECO_CNTL: 1-SP GPU */
++	gpu_wr(0xe81, 1u << 29);                        /* UCHE_MODE_CNTL */
++	gpu_wr(0x833, 0x02000000);                      /* CP_CHICKEN_DBG */
++	gpu_wr(0x94, 0xA6FFFFFF);                       /* RBBM_AHB_CNTL1 */
++	gpu_wr(0x95, 0x3F);                             /* RBBM_AHB_CNTL2 */
++	gpu_wr(0xf02, 1u << 7);                         /* TPL1_MODE_CNTL: highest bank bit 14 */
++	gpu_wr(0xcc6, 1u << 1);                         /* RB_MODE_CNTL */
++	gpu_wr(0xe8f, 1);                               /* UCHE_DBG_ECO_CNTL_2 */
++	gpu_wr(0xe60, gpu_rd(0xe60) | (1u << 10) | (1u << 23));  /* VPC_DBG_ECO_CNTL: ALLFLATOPTDIS, LMLOADKILL */
++	gpu_wr(0xe04, gpu_rd(0xe04) & ~(1u << 18));     /* HLSQ_DBG_ECO_CNTL: LMLOADKILL */
++	gpu_wr(0x8a0, 7);                               /* CP_PROTECT_CNTL */
++	for (unsigned i = 0; i < sizeof(protect) / sizeof(protect[0]); i++) {
++		gpu_wr(0x880 + i, protect[i]);
++	}
++	gpu_wr(0xf803, 0);                              /* RBBM_SECVID_TSB_CNTL */
++	gpu_wr64(0xf800, 0);
++	gpu_wr(0xf802, 0);
+ 	for (unsigned i = 0; i < sizeof(addr_mode) / sizeof(addr_mode[0]); i++) {
+ 		gpu_wr(addr_mode[i], 1);
+ 	}
+-	for (unsigned i = 0; i < sizeof(a612_hwcg) / sizeof(a612_hwcg[0]); i++) {
+-		gpu_wr(a612_hwcg[i][0], a612_hwcg[i][1]);
+-	}
+-	gpu_wr(0xAE, 0xaaa8aa82);                       /* RBBM_CLOCK_CNTL: a610 clock_cntl_on */
+-	for (unsigned i = 0; i < 4; i++) {
+-		gpu_wr(0x3c03 + i, 0x00071620);
+-	}
+-	gpu_wr(0x11, 3);
+-	gpu_wr64(0xE05, 0x1fffffffff000ull + 0xfc0);
+-	gpu_wr64(0xE09, 0x1fffffffff000ull);
+-	gpu_wr64(0xE07, 0x1fffffffff000ull);
+-	gpu_wr64(0xE0B, GMEM_BASE);
+-	gpu_wr64(0xE0D, GMEM_BASE + GMEM_SIZE - 1);
+-	gpu_wr(0xE18, 0x804);
+-	gpu_wr(0xE17, 4);
+-	gpu_wr(0x8c2, 0x00800060);
+-	gpu_wr(0x8c1, 0x40201b16);
+-	gpu_wr(0x8C3, 48);
+-	gpu_wr(0x9e00, 0x00080000);
+-	gpu_wr(0x98d, 1);
+-	gpu_wr(0x1f, (1u << 30) | 0x3ffff);
+-	gpu_wr(0xe19, 0x81);
+-	gpu_wr(0x500, 1);                               /* RBBM_PERFCTR_CNTL */
+-	gpu_wr(0x90E, 47);                              /* CP_MEM_POOL_DBG_ADDR */
+-	gpu_wr(0x50B, 0xffffffff);                      /* RBBM_PERFCTR_GPU_BUSY_MASKED */
+-	gpu_wr(0x8D0, 0);                               /* CP_PERFCTR_CP_SEL0 */
+-	gpu_wr(0x8e08, 0x9);                            /* RB_NC_MODE_CNTL */
+-	gpu_wr(0xb604, 0x9);                            /* TPL1_NC_MODE_CNTL */
+-	gpu_wr(0xae02, 0x9);                            /* SP_NC_MODE_CNTL */
+-	gpu_wr(0xE01, 1u << 23);                        /* UCHE_MODE_CNTL */
+-	gpu_wr(0x534, 0);                               /* RBBM_NC_MODE_CNTL */
++}
++
++/* PM4 or PFP: the first dword of the file is a version, not code (adreno_fw_create_bo). */
++static bool
++fw_buffer(struct kbuf *b, const char *name)
++{
++	const void *fw = NULL;
++	size_t size = 0;
++
++	if (!fw_get(name, &fw, &size) || size <= 4 || !kbuf_alloc(b, size - 4) || !kbuf_map(b)) {
++		IOLog("TopazGPU: %s: firmware or buffer failed\n", name);
++		return false;
++	}
++	memcpy(b->va, (const uint8_t *)fw + 4, size - 4);
++	sweet_dcache_clean((vm_offset_t)b->va, (unsigned)(size - 4));
++	return true;
+ }
+ 
+ static bool
+ cp_start(void)
+ {
+-	void *fw = NULL;
+-	size_t fw_size = 0;
+-
+-	fw = (void *)topaz_fw_sqe_fw;
+-	fw_size = topaz_fw_sqe_fw_size;
+-	IOLog("TopazGPU: cp: SQE %zu bytes, allocating ring\n", fw_size);
+-	if ((sqe.md == NULL && (!kbuf_alloc(&sqe, fw_size - 4) || !kbuf_map(&sqe))) ||
+-	    (ring.md == NULL && (!kbuf_alloc(&ring, RB_BYTES) || !kbuf_map(&ring))) ||
+-	    (mem.md == NULL && (!kbuf_alloc(&mem, PAGE_SIZE) || !kbuf_map(&mem)))) {
++	if ((pm4.va == NULL && !fw_buffer(&pm4, "pm4")) || (pfp.va == NULL && !fw_buffer(&pfp, "pfp")) ||
++	    (ring.va == NULL && (!kbuf_alloc(&ring, RB_BYTES) || !kbuf_map(&ring))) ||
++	    (mem.va == NULL && (!kbuf_alloc(&mem, PAGE_SIZE) || !kbuf_map(&mem)))) {
+ 		IOLog("TopazGPU: CP buffers failed\n");
+ 		return false;
+ 	}
+-	memcpy(sqe.va, (const uint8_t *)fw + 4, fw_size - 4);
+-	sweet_dcache_clean((vm_offset_t)sqe.va, (unsigned)(fw_size - 4));
+-	IOLog("TopazGPU: cp: SQE at GPU %#llx, ring %#llx\n", sqe.iova, ring.iova);
++	IOLog("TopazGPU: cp: PM4 at GPU %#llx, PFP %#llx, ring %#llx, mem %#llx\n", pm4.iova, pfp.iova, ring.iova, mem.iova);
+ 	tlb_flush();
+ 	hw_init_regs();
+-	gpu_wr64(0x830, sqe.iova);                      /* CP_SQE_INSTR_BASE */
++	gpu_wr64(0x838, pm4.iova);                      /* CP_ME_INSTR_BASE */
++	gpu_wr64(0x835, pfp.iova);                      /* CP_PFP_INSTR_BASE */
+ 	gpu_wr64(0x800, ring.iova);                     /* CP_RB_BASE */
+-	gpu_wr(0x802, 12 | (2 << 8) | (1u << 27));      /* CP_RB_CNTL */
++	gpu_wr(0x802, 12 | (2 << 8) | (1u << 27));      /* CP_RB_CNTL: 32 KB, no rptr shadow */
+ 	wptr = 0;
+ 	gpu_wr(0x807, 0);
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+-	gpu_wr(0x808, 1);                               /* CP_SQE_CNTL */
++	gpu_wr(0x832, 0);                               /* CP_PFP_ME_CNTL: clear ME_HALT */
++	IOLog("TopazGPU: cp: started, RBBM_STATUS %08x\n", gpu_rd(0x4f5));
+ 
+ 	emit(pkt7(CP_ME_INIT, 8));
+ 	emit(0x2f);
+@@ -991,13 +934,58 @@ cp_start(void)
+ 	if (!ring_idle(100)) {
+ 		return false;
+ 	}
++	IOLog("TopazGPU: CP up (ME_INIT), core %u MHz\n", core_mhz);
++	return true;
++}
++
++static bool
++leave_secure(void)
++{
++	if (!zap_load()) {
++		return false;
++	}
+ 	emit(pkt7(CP_SET_SECURE_MODE, 1));
+ 	emit(0);
+ 	kick();
+ 	if (!ring_idle(100)) {
+ 		return false;
+ 	}
+-	IOLog("TopazGPU: CP up (ME_INIT, SET_SECURE_MODE 0), core %u MHz\n", core_mhz);
++	IOLog("TopazGPU: secure mode left\n");
++	return true;
++}
++
++static bool
++fence_test(void)
++{
++	uint32_t want = ++seqno;
++
++	emit(pkt7(CP_EVENT_WRITE, 4));
++	emit(CACHE_FLUSH_TS);
++	emit((uint32_t)mem.iova);
++	emit((uint32_t)(mem.iova >> 32));
++	emit(want);
++	kick();
++	for (int i = 0; i < 1000; i++) {
++		if (*(volatile uint32_t *)mem.va == want) {
++			IOLog("TopazGPU: fence ok after %d ms, rptr %u wptr %u\n", i, gpu_rd(0x806), wptr % RB_DWORDS);
++			return true;
++		}
++		IOSleep(1);
++	}
++	IOLog("TopazGPU: no fence: mem %08x want %u, rptr %u wptr %u RBBM_STATUS %08x CP_HW_FAULT %08x\n",
++	    *(volatile uint32_t *)mem.va, want, gpu_rd(0x806), wptr % RB_DWORDS, gpu_rd(0x4f5), gpu_rd(0xb1a));
++	smmu_fault("fence");
++	return false;
++}
++
++/* gpu_step: stop here? */
++static bool
++step_done(uint32_t n)
++{
++	if (gpu_step != n) {
++		return false;
++	}
++	IOLog("TopazGPU: step %u reached, stopping here (gpu_step)\n", n);
+ 	return true;
+ }
+ 
+@@ -1012,13 +1000,21 @@ hw_start(void)
+ 		IOLog("TopazGPU: map failed\n");
+ 		return false;
+ 	}
++	gpucc += GPUCC_OFF;
+ 	va_free_count = 0;
+ 	redwood_gpu_address_free(VA_USER_START, VA_KERNEL - VA_USER_START);
++	IOLog("TopazGPU: power up\n");
+ 	if (!power_up()) {
+ 		return false;
+ 	}
+-	IOLog("TopazGPU: powered: RBBM_STATUS %08x\n", gpu_rd(0x210));
+-	return zap_load() && smmu_setup() && cp_start();
++	IOLog("TopazGPU: powered: RBBM_STATUS %08x\n", gpu_rd(0x4f5));
++	gpu_wr(0xb78, 0x5a5a1234);                      /* CP_SCRATCH 0 */
++	IOLog("TopazGPU: scratch readback %08x (want 5a5a1234)\n", gpu_rd(0xb78));
++	if (step_done(1) || !smmu_setup() || step_done(2) || !cp_start() || step_done(3) ||
++	    !leave_secure() || step_done(4) || !fence_test() || step_done(5)) {
++		return false;
++	}
++	return true;
+ }
+ 
+ /* ---------------------------------------------------------------- the interface RedwoodGPU.cpp uses */
+@@ -1033,19 +1029,19 @@ bool
+ redwood_gpu_parameter(uint32_t which, uint64_t *value)
+ {
+ 	switch (which) {
+-	case 0x01: *value = 610; return true;                   /* GPU_ID */
++	case 0x01: *value = 512; return true;                   /* GPU_ID */
+ 	case 0x02: *value = GMEM_SIZE; return true;             /* GMEM_SIZE */
+-	case 0x03: *value = 0x06010001; return true;            /* CHIP_ID */
++	case 0x03: *value = 0x05010200; return true;            /* CHIP_ID */
+ 	case 0x04: *value = core_mhz * 1000000ull; return true; /* MAX_FREQ */
+ 	case 0x05:                                              /* TIMESTAMP: CP always-on counter */
+-		*value = ready ? ((uint64_t)gpu_rd(0x981) << 32 | gpu_rd(0x980)) : 0;
++		*value = ready ? ((uint64_t)gpu_rd(0x4d3) << 32 | gpu_rd(0x4d2)) : 0;
+ 		return true;
+ 	case 0x06: *value = GMEM_BASE; return true;             /* GMEM_BASE */
+ 	case 0x07: *value = 1; return true;                     /* PRIORITIES */
+ 	case 0x08: case 0x09: case 0x0a: case 0x11:             /* PP_PGTABLE FAULTS SUSPENDS RAYTRACING */
+ 		*value = 0;
+ 		return true;
+-	case 0x10: *value = 13; return true;                    /* HIGHEST_BANK_BIT (a6xx_calc_ubwc_config a610) */
++	case 0x10: *value = 14; return true;                    /* HIGHEST_BANK_BIT (stock DT) */
+ 	case 0x12: *value = 7; return true;                     /* UBWC_SWIZZLE */
+ 	case 0x13: *value = 0; return true;                     /* MACROTILE_MODE */
+ 	default:
+@@ -1160,10 +1156,10 @@ redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t co
+ void
+ redwood_gpu_report(const char *why)
+ {
+-	uint64_t ib1 = gpu_rd(0x928) | ((uint64_t)gpu_rd(0x929) << 32);
++	uint64_t ib1 = gpu_rd(0xb1f) | ((uint64_t)gpu_rd(0xb20) << 32);
+ 	IOLog("TopazGPU: %s: fence %u done %u rptr %u wptr %u RBBM_STATUS %08x CP_HW_FAULT %08x IB1 %llx rem %u\n", why,
+-	    seqno, mem.va ? *(volatile uint32_t *)mem.va : 0, gpu_rd(0x806), wptr % RB_DWORDS, gpu_rd(0x210),
+-	    gpu_rd(0x821), ib1, gpu_rd(0x92A));
++	    seqno, mem.va ? *(volatile uint32_t *)mem.va : 0, gpu_rd(0x806), wptr % RB_DWORDS, gpu_rd(0x4f5),
++	    gpu_rd(0xb1a), ib1, gpu_rd(0xb21));
+ 	smmu_fault(why);
+ }
+ 
+@@ -1171,7 +1167,7 @@ void
+ redwood_gpu_stop(void)
+ {
+ 	if (ready) {
+-		gpu_wr(0x808, 0);
++		gpu_wr(0x832, 0x14000000);                      /* CP_PFP_ME_CNTL: ME and PFP halt */
+ 	}
+ 	ready = false;
+ }
+@@ -1205,23 +1201,21 @@ topaz_adreno_thread(__unused void *param, __unused wait_result_t wr_)
+ 	}
+ 	ready = true;
+ 	RedwoodGPUStart();
+-	IOLog("TopazGPU: Adreno 610 ready, RedwoodGPU published\n");
++	IOLog("TopazGPU: Adreno 512 ready, RedwoodGPU published\n");
+ }
+ 
+ void
+ topaz_adreno_init(void)
+ {
+-	uint32_t on = 0, mhz = 0;
++	uint32_t on = 0;
+ 	thread_t thread;
+ 
+ 	if (!PE_parse_boot_argn("gpu", &on, sizeof(on)) || on == 0 || hw_lock != NULL) {
+ 		return;
+ 	}
++	(void)PE_parse_boot_argn("gpu_step", &gpu_step, sizeof(gpu_step));
+ 	(void)PE_parse_boot_argn("gpu_identity", &gpu_identity, sizeof(gpu_identity));
+ 	(void)PE_parse_boot_argn("gpu_midmem", &gpu_midmem, sizeof(gpu_midmem));
+-	if (PE_parse_boot_argn("gpu_mhz", &mhz, sizeof(mhz)) && mhz >= 300) {
+-		core_mhz = mhz;                                 /* (checked against the OPP table in power_up) */
+-	}
+ 	hw_lock = IOLockAlloc();
+ 	if (kernel_thread_start(topaz_adreno_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
