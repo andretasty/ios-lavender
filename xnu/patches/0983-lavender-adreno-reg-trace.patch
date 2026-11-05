@@ -1,0 +1,161 @@
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index c13838c..76bd573 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -677,13 +677,23 @@ static uint32_t gpu_smmu = 1;
+ static bool
+ smmu_setup(void)
+ {
+-	IOLog("TopazGPU: smmu mode %u: idr0 %08x sCR0 %08x S2CR0 %08x SMR0 %08x CB0 sctlr %08x gfsr %08x\n", gpu_smmu,
+-	    rd(smmu, 0x20), rd(smmu, 0x0), rd(smmu, 0xC00), rd(smmu, 0x800), rd(smmu, SMMU_CB0), rd(smmu, 0x48));
++	IOLog("TopazGPU: smmu mode %u: idr0 %08x idr1 %08x sCR0 %08x gfsr %08x\n", gpu_smmu, rd(smmu, 0x20), rd(smmu, 0x24), rd(smmu, 0x0), rd(smmu, 0x48));
++	for (uint32_t n = 0; n < 4; n++) {
++		IOLog("TopazGPU: smmu group %u: SMR %08x S2CR %08x CB sctlr %08x CBAR %08x\n", n, rd(smmu, 0x800 + 4 * n),
++		    rd(smmu, 0xC00 + 4 * n), rd(smmu, SMMU_CB0 + 0x1000 * n), rd(smmu, 0x1000 + 4 * n));
++	}
+ 	switch (gpu_smmu) {
+ 	case 0:
+ 		break;
+ 	case 3:
+-		smmu_step(0x0, rd(smmu, 0x0) | 1u);
++		smmu_step(0x0, rd(smmu, 0x0) | 1u);             /* sCR0.CLIENTPD: bypass everything */
++		break;
++	case 4:
++		smmu_step(0x0, rd(smmu, 0x0) & ~(1u << 10));    /* sCR0.USFCFG off: unmatched streams pass */
++		break;
++	case 5:
++		smmu_step(0xC04, 1u << 16);                     /* group 1: S2CR bypass */
++		smmu_step(0x804, (1u << 31) | (1u << 16));      /* SMR1: SID 0 mask 1 */
+ 		break;
+ 	case 2:
+ 		if (l1.va == NULL && !table_alloc(&l1)) {
+@@ -858,6 +868,24 @@ static const uint32_t a512_hwcg[][2] = {	/* Linux a5xx_gpu.c, offsets from a5xx.
+ 
+ #define PROTECT_RW(reg, log2len)        ((1u << 30) | (1u << 29) | ((uint32_t)(log2len) << 24) | (((uint32_t)(reg) << 2) & 0xFFFFF))
+ 
++/* bring-up: a write that aborts or hangs names itself in the log (boot-arg gpu_log=1) */
++static void
++gw(uint32_t reg, uint32_t v)
++{
++	if (gpu_log) {
++		IOLog("TopazGPU: reg %#x <- %08x\n", reg, v);
++	}
++	gpu_wr(reg, v);
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++gw64(uint32_t reg, uint64_t v)
++{
++	gw(reg, (uint32_t)v);
++	gw(reg + 1, (uint32_t)(v >> 32));
++}
++
+ static void
+ hw_init_regs(void)
+ {
+@@ -870,50 +898,50 @@ hw_init_regs(void)
+ 	};
+ 
+ 	/* a5xx_pm_resume: a512 has no GPMU, RBBM suspend/resume by hand */
+-	gpu_wr(0x67, 0x00000055);
++	gw(0x67, 0x00000055);
+ 	for (unsigned i = 0; i < sizeof(a512_hwcg) / sizeof(a512_hwcg[0]); i++) {
+-		gpu_wr(a512_hwcg[i][0], a512_hwcg[i][1]);
++		gw(a512_hwcg[i][0], a512_hwcg[i][1]);
+ 	}
+-	gpu_wr(0x67, 0xAAA8AA00);
+-	gpu_wr(0x533, 0x182);
+-	gpu_wr(0x67, gpu_rd(0x67) & ~0xffu);
++	gw(0x67, 0xAAA8AA00);
++	gw(0x533, 0x182);
++	gw(0x67, gpu_rd(0x67) & ~0xffu);
+ 
+ 	/* a5xx_hw_init */
+-	gpu_wr(0x3049, 3);                              /* VBIF_ROUND_ROBIN_QOS_ARB */
+-	gpu_wr(0x302a, 9);                              /* VBIF_GATE_OFF_WRREQ_EN */
+-	gpu_wr(0x46f, 0xffffffff);                      /* RBBM_PERFCTR_GPU_BUSY_MASKED */
+-	gpu_wr(0x93, 1);                                /* RBBM_AHB_CNTL0 */
+-	gpu_wr(0x2f, (1u << 30) | 0xFFFF);              /* RBBM_INTERFACE_HANG_INT_CNTL */
+-	gpu_wr(0x464, 1);                               /* RBBM_PERFCTR_CNTL */
+-	gpu_wr(0xe96, 2);                               /* UCHE_CACHE_WAYS */
+-	gpu_wr64(0xe89, 0x1fffffffff000ull);            /* UCHE_TRAP_BASE */
+-	gpu_wr64(0xe87, 0x1fffffffff000ull);            /* UCHE_WRITE_THRU_BASE */
+-	gpu_wr64(0xe8b, GMEM_BASE);
+-	gpu_wr64(0xe8d, GMEM_BASE + GMEM_SIZE - 1);
+-	gpu_wr(0x825, 0x40);                            /* CP_MEQ_THRESHOLDS */
+-	gpu_wr(0x826, 0x400);                           /* CP_MERCIU_SIZE */
+-	gpu_wr(0x820, 0x80000060);                      /* CP_ROQ_THRESHOLDS_2 */
+-	gpu_wr(0x81f, 0x40201B16);                      /* CP_ROQ_THRESHOLDS_1 */
+-	gpu_wr(0xd00, (0x200u << 11) | (0x200u << 22)); /* PC_DBG_ECO_CNTL */
+-	gpu_wr(0xcc4, gpu_rd(0xcc4) | (1u << 9));       /* RB_DBG_ECO_CNTL: 1-SP GPU */
+-	gpu_wr(0xe81, 1u << 29);                        /* UCHE_MODE_CNTL */
+-	gpu_wr(0x833, 0x02000000);                      /* CP_CHICKEN_DBG */
+-	gpu_wr(0x94, 0xA6FFFFFF);                       /* RBBM_AHB_CNTL1 */
+-	gpu_wr(0x95, 0x3F);                             /* RBBM_AHB_CNTL2 */
+-	gpu_wr(0xf02, 1u << 7);                         /* TPL1_MODE_CNTL: highest bank bit 14 */
+-	gpu_wr(0xcc6, 1u << 1);                         /* RB_MODE_CNTL */
+-	gpu_wr(0xe8f, 1);                               /* UCHE_DBG_ECO_CNTL_2 */
+-	gpu_wr(0xe60, gpu_rd(0xe60) | (1u << 10) | (1u << 23));  /* VPC_DBG_ECO_CNTL: ALLFLATOPTDIS, LMLOADKILL */
+-	gpu_wr(0xe04, gpu_rd(0xe04) & ~(1u << 18));     /* HLSQ_DBG_ECO_CNTL: LMLOADKILL */
+-	gpu_wr(0x8a0, 7);                               /* CP_PROTECT_CNTL */
++	gw(0x3049, 3);                              /* VBIF_ROUND_ROBIN_QOS_ARB */
++	gw(0x302a, 9);                              /* VBIF_GATE_OFF_WRREQ_EN */
++	gw(0x46f, 0xffffffff);                      /* RBBM_PERFCTR_GPU_BUSY_MASKED */
++	gw(0x93, 1);                                /* RBBM_AHB_CNTL0 */
++	gw(0x2f, (1u << 30) | 0xFFFF);              /* RBBM_INTERFACE_HANG_INT_CNTL */
++	gw(0x464, 1);                               /* RBBM_PERFCTR_CNTL */
++	gw(0xe96, 2);                               /* UCHE_CACHE_WAYS */
++	gw64(0xe89, 0x1fffffffff000ull);            /* UCHE_TRAP_BASE */
++	gw64(0xe87, 0x1fffffffff000ull);            /* UCHE_WRITE_THRU_BASE */
++	gw64(0xe8b, GMEM_BASE);
++	gw64(0xe8d, GMEM_BASE + GMEM_SIZE - 1);
++	gw(0x825, 0x40);                            /* CP_MEQ_THRESHOLDS */
++	gw(0x826, 0x400);                           /* CP_MERCIU_SIZE */
++	gw(0x820, 0x80000060);                      /* CP_ROQ_THRESHOLDS_2 */
++	gw(0x81f, 0x40201B16);                      /* CP_ROQ_THRESHOLDS_1 */
++	gw(0xd00, (0x200u << 11) | (0x200u << 22)); /* PC_DBG_ECO_CNTL */
++	gw(0xcc4, gpu_rd(0xcc4) | (1u << 9));       /* RB_DBG_ECO_CNTL: 1-SP GPU */
++	gw(0xe81, 1u << 29);                        /* UCHE_MODE_CNTL */
++	gw(0x833, 0x02000000);                      /* CP_CHICKEN_DBG */
++	gw(0x94, 0xA6FFFFFF);                       /* RBBM_AHB_CNTL1 */
++	gw(0x95, 0x3F);                             /* RBBM_AHB_CNTL2 */
++	gw(0xf02, 1u << 7);                         /* TPL1_MODE_CNTL: highest bank bit 14 */
++	gw(0xcc6, 1u << 1);                         /* RB_MODE_CNTL */
++	gw(0xe8f, 1);                               /* UCHE_DBG_ECO_CNTL_2 */
++	gw(0xe60, gpu_rd(0xe60) | (1u << 10) | (1u << 23));  /* VPC_DBG_ECO_CNTL: ALLFLATOPTDIS, LMLOADKILL */
++	gw(0xe04, gpu_rd(0xe04) & ~(1u << 18));     /* HLSQ_DBG_ECO_CNTL: LMLOADKILL */
++	gw(0x8a0, 7);                               /* CP_PROTECT_CNTL */
+ 	for (unsigned i = 0; i < sizeof(protect) / sizeof(protect[0]); i++) {
+-		gpu_wr(0x880 + i, protect[i]);
++		gw(0x880 + i, protect[i]);
+ 	}
+-	gpu_wr(0xf803, 0);                              /* RBBM_SECVID_TSB_CNTL */
+-	gpu_wr64(0xf800, 0);
+-	gpu_wr(0xf802, 0);
++	gw(0xf803, 0);                              /* RBBM_SECVID_TSB_CNTL */
++	gw64(0xf800, 0);
++	gw(0xf802, 0);
+ 	for (unsigned i = 0; i < sizeof(addr_mode) / sizeof(addr_mode[0]); i++) {
+-		gpu_wr(addr_mode[i], 1);
++		gw(addr_mode[i], 1);
+ 	}
+ }
+ 
+@@ -955,7 +983,7 @@ cp_start(void)
+ 	gpu_wr(0x807, 0);
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	gpu_wr(0x832, 0);                               /* CP_PFP_ME_CNTL: clear ME_HALT */
+-	IOLog("TopazGPU: cp: started, RBBM_STATUS %08x\n", gpu_rd(0x4f5));
++	IOLog("TopazGPU: cp: started, RBBM_STATUS %08x gfsr %08x\n", gpu_rd(0x4f5), rd(smmu, 0x48));
+ 
+ 	emit(pkt7(CP_ME_INIT, 8));
+ 	emit(0x2f);
+@@ -1250,6 +1278,7 @@ topaz_adreno_init(void)
+ 		return;
+ 	}
+ 	(void)PE_parse_boot_argn("gpu_step", &gpu_step, sizeof(gpu_step));
++	(void)PE_parse_boot_argn("gpu_log", &gpu_log, sizeof(gpu_log));
+ 	(void)PE_parse_boot_argn("gpu_smmu", &gpu_smmu, sizeof(gpu_smmu));
+ 	(void)PE_parse_boot_argn("gpu_identity", &gpu_identity, sizeof(gpu_identity));
+ 	(void)PE_parse_boot_argn("gpu_midmem", &gpu_midmem, sizeof(gpu_midmem));
